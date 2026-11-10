@@ -1,0 +1,1332 @@
+// quickjs.esk: JavaScript in an Eskiu program, over QuickJS (<quickjs>).
+//
+// A JsRuntime owns the heap, the limits, the module loader and the host
+// functions; a JsContext is one global scope inside it. Scripts and ES modules
+// are evaluated in a context, and their values come back as JsValue handles:
+//
+//     *JsRuntime rt = js_runtime()?;
+//     defer rt.release();
+//     rt.set_fs_loader("scripts");
+//     JsContext ctx = rt.context()?;
+//     defer ctx.release();
+//     JsValue engine = ctx.object();
+//     engine.set_fn("log", 1, JsValue(*JsContext c, *JsArgs a) {
+//         printf("%s\n", a.str(0));
+//         return c.undefined();
+//     });
+//     ctx.set_global("engine", engine);
+//     JsValue ns = ctx.eval_file("scripts/main.js")?;
+//     ns.free();
+//     JsValue r = ctx.call_global("onUpdate", &dt, 1)?;
+//     r.free();
+//
+// Ownership: every JsValue a function returns is owned by the caller and is freed
+// with free(), except the arguments a host function receives (JsArgs.at), which are
+// borrowed. Functions documented as "consuming" a value free it themselves.
+// release() on a runtime reports values that were never freed.
+//
+// Fallible operations return a Result whose error is the JavaScript exception as
+// text: "Name: message" followed by the stack ("    at f (main.js:3:9)"). The
+// same exception, split into fields, stays in js_last_error() until the next one.
+
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <fs>;
+import <quickjs/raw>;
+
+// Value kinds, as JsValue.kind() reports them.
+const int JS_UNDEFINED = 0;
+const int JS_NULL = 1;
+const int JS_BOOL = 2;
+const int JS_NUMBER = 3;
+const int JS_STRING = 4;
+const int JS_SYMBOL = 5;
+const int JS_BIGINT = 6;
+const int JS_OBJECT = 7;
+const int JS_ARRAY = 8;
+const int JS_FUNCTION = 9;
+const int JS_ERROR = 10;
+const int JS_EXCEPTION = 11;
+
+// Typed array element types for JsContext.typed_array.
+const int JS_U8 = 0;
+const int JS_I8 = 1;
+const int JS_U16 = 2;
+const int JS_I16 = 3;
+const int JS_U32 = 4;
+const int JS_I32 = 5;
+const int JS_F32 = 6;
+const int JS_F64 = 7;
+
+// A host function: it receives the calling context and its arguments and returns
+// the result, owned by the caller (usually made with the context's constructors).
+// Returning c.throw_error(msg) throws msg in the script; returning a value whose
+// kind is JS_EXCEPTION passes on the exception already pending.
+type JsFn = fn(*JsContext, *JsArgs)->JsValue;
+
+// Resolves module `name` imported from module `base` (the importer's resolved name,
+// or "" for JsContext.import): appends the resolved name to out and returns true, or
+// returns false when the module does not exist.
+type JsResolveFn = fn(string, string, *String)->bool;
+
+// Appends the source of the resolved module `path` to out and returns true, or
+// returns false when it cannot be read.
+type JsLoadFn = fn(string, *String)->bool;
+
+// Returns true to stop the running script, which then fails with
+// "InternalError: interrupted".
+type JsInterruptFn = fn()->bool;
+
+struct _JsHostFn {
+    JsFn f;
+}
+
+// The QuickJS runtime: one heap, its limits, the module loader and the host
+// functions of its contexts. Made by js_runtime; freed by release.
+struct JsRuntime {
+    *JSRuntime handle;
+    List<_JsHostFn> fns;
+    JsResolveFn resolver;
+    JsLoadFn loader;
+    JsInterruptFn interrupt;
+    bool has_resolver;
+    bool has_loader;
+    bool has_interrupt;
+    String root;
+    bool fs_loader;
+}
+
+// One global scope inside a runtime. Made by JsRuntime.context; freed by release.
+struct JsContext {
+    *JSContext handle;
+    *JsRuntime rt;
+}
+
+// A JavaScript value and the context it belongs to.
+struct JsValue {
+    JSValue raw;
+    *JSContext ctx;
+}
+
+// The arguments of a host function call. Values from at() and strings from str()
+// are borrowed: they stay valid until the host function returns.
+struct JsArgs {
+    *JSValue argv;
+    int argc;
+    *JSContext ctx;
+    *JSValue this_raw;
+    List<*char> strs;
+}
+
+// A JavaScript exception split into fields. file and line come from the first
+// frame of the stack that names a file (empty and 0 when there is none).
+struct JsError {
+    String name;
+    String message;
+    String stack;
+    String file;
+    int line;
+    int column;
+    bool interrupted;
+}
+
+// Memory figures of a runtime (JsRuntime.memory).
+struct JsMemory {
+    int64 malloc_size;
+    int64 malloc_limit;
+    int64 malloc_count;
+    int64 objects;
+    int64 strings;
+    int64 atoms;
+    int64 functions;
+    int64 used;
+}
+
+String _js_err;
+JsError _js_last;
+bool _js_ready = false;
+
+// --- runtime ----------------------------------------------------------------
+
+int _js_dispatch(*void host, *JSContext c, int id, *JSValue this_val, int argc, *JSValue argv, *JSValue ret) {
+    *JsRuntime rt = (*JsRuntime)host;
+    let ctx: JsContext;
+    ctx.handle = c;
+    ctx.rt = rt;
+    let a: JsArgs;
+    a.argv = argv;
+    a.argc = argc;
+    a.ctx = c;
+    a.this_raw = this_val;
+    List_init<*char>(&a.strs, 4);
+    if (id < 0 || id >= rt.fns.size) {
+        eq_throw(c, EQ_THROW_INTERNAL, "quickjs: unknown host function", ret);
+    } else {
+        JsFn f = rt.fns.data[id].f;
+        JsValue r = f(&ctx, &a);
+        *ret = r.raw;
+    }
+    for (i in 0..a.strs.size) eq_free_cstring(c, a.strs.data[i]);
+    List_free<*char>(&a.strs);
+    return 0;
+}
+
+*char _js_resolve(*void host, string base, string name) {
+    *JsRuntime rt = (*JsRuntime)host;
+    let out: String;
+    String_init(&out, 64);
+    bool ok = false;
+    if (rt.has_resolver) {
+        JsResolveFn f = rt.resolver;
+        ok = f(base, name, &out);
+    } else if (rt.fs_loader) {
+        ok = js_fs_resolve(rt.root.cstr(), base, name, &out);
+    }
+    if (!ok) {
+        out.free();
+        return null;
+    }
+    return out.data;
+}
+
+*char _js_load(*void host, string path, *int64 len) {
+    *JsRuntime rt = (*JsRuntime)host;
+    let out: String;
+    String_init(&out, 256);
+    bool ok = false;
+    if (rt.has_loader) {
+        JsLoadFn f = rt.loader;
+        ok = f(path, &out);
+    } else if (rt.fs_loader) {
+        ok = fs_read_text(path, &out) == 0;
+    }
+    if (!ok) {
+        out.free();
+        return null;
+    }
+    *len = out.len;
+    return out.data;
+}
+
+int _js_interrupt(*void host) {
+    *JsRuntime rt = (*JsRuntime)host;
+    if (!rt.has_interrupt) return 0;
+    JsInterruptFn f = rt.interrupt;
+    return f() ? 1 : 0;
+}
+
+void _js_init() {
+    if (_js_ready) return;
+    eq_set_callbacks(_js_dispatch, _js_resolve, _js_load, _js_interrupt);
+    String_init(&_js_err, 128);
+    String_init(&_js_last.name, 16);
+    String_init(&_js_last.message, 64);
+    String_init(&_js_last.stack, 128);
+    String_init(&_js_last.file, 64);
+    _js_ready = true;
+}
+
+// The QuickJS version this package is built on, such as "2024-02-14".
+string js_quickjs_version() {
+    return eq_quickjs_version();
+}
+
+// Blocks and bytes allocated by every runtime of the process and not freed yet.
+// Both are 0 once every runtime has been released with nothing leaked.
+int64 js_live_blocks() { return eq_live_blocks(); }
+
+// The bytes of those blocks (see js_live_blocks).
+int64 js_live_bytes() { return eq_live_bytes(); }
+
+// A new runtime with QuickJS's defaults: no memory limit, a 256 KiB JavaScript
+// stack limit, no module loader and no interrupt handler.
+Result<*JsRuntime, string> js_runtime() {
+    _js_init();
+    if (eq_abi_version() != EQ_ABI_VERSION) {
+        String_clear(&_js_err);
+        String_appendf(&_js_err, "quickjs: the native library has ABI %d, this package needs %d",
+            eq_abi_version(), EQ_ABI_VERSION);
+        return Err<*JsRuntime, string>(_js_err.data);
+    }
+    *JsRuntime rt = alloc<JsRuntime>(1);
+    List_init<_JsHostFn>(&rt.fns, 16);
+    String_init(&rt.root, 16);
+    rt.handle = eq_runtime_new((*void)rt);
+    if (rt.handle == null) {
+        List_free<_JsHostFn>(&rt.fns);
+        rt.root.free();
+        free((*void)rt);
+        return Err<*JsRuntime, string>("quickjs: could not create a runtime (out of memory)");
+    }
+    return Ok<*JsRuntime, string>(rt);
+}
+
+// Frees the runtime, its host functions and loader. Every context must be released
+// first. Returns 0, or the number of JavaScript objects still referenced by values
+// that were never freed: the runtime's memory is then left allocated (QuickJS cannot
+// free a heap with live objects) and js_live_blocks() stays above 0.
+int64 JsRuntime_release(*JsRuntime self) {
+    if (self == null || self.handle == null) return 0;
+    int64 leaked = eq_runtime_free(self.handle);
+    self.handle = null;
+    for (i in 0..self.fns.size) free_closure(self.fns.data[i].f);
+    List_free<_JsHostFn>(&self.fns);
+    if (self.has_resolver) free_closure(self.resolver);
+    if (self.has_loader) free_closure(self.loader);
+    if (self.has_interrupt) free_closure(self.interrupt);
+    self.root.free();
+    free((*void)self);
+    return leaked;
+}
+
+// Caps the heap at `bytes` (0: no limit). An allocation past it fails the running
+// script with "InternalError: out of memory".
+void JsRuntime_set_memory_limit(*JsRuntime self, int64 bytes) {
+    eq_set_memory_limit(self.handle, bytes);
+}
+
+// Sets the JavaScript stack limit in bytes (0: no limit). Deep recursion past it
+// fails with "InternalError: stack overflow" instead of overflowing
+// the thread's stack, so it must stay below the stack of the thread that runs the
+// scripts (8 MiB on the main thread of macOS and Linux, 1 MiB on Windows).
+void JsRuntime_set_max_stack_size(*JsRuntime self, int64 bytes) {
+    eq_set_max_stack_size(self.handle, bytes);
+}
+
+// Takes the current stack position as the top of the JavaScript stack: call it
+// when the runtime moves to another thread.
+void JsRuntime_update_stack_top(*JsRuntime self) {
+    eq_update_stack_top(self.handle);
+}
+
+// Runs the cycle collector when the heap grows by `bytes` (QuickJS's default is 256 KiB).
+void JsRuntime_set_gc_threshold(*JsRuntime self, int64 bytes) {
+    eq_set_gc_threshold(self.handle, bytes);
+}
+
+// Collects unreachable cycles now.
+void JsRuntime_gc(*JsRuntime self) {
+    eq_run_gc(self.handle);
+}
+
+// Stops any script still running `ms` milliseconds from now (0: no limit), with
+// "InternalError: interrupted". The deadline counts from this call, so call it again
+// before each slice of work to bound (a boot, a frame).
+void JsRuntime_set_time_limit(*JsRuntime self, int64 ms) {
+    eq_set_time_limit(self.handle, ms);
+}
+
+// Calls `f` every few thousand instructions; when it returns true the script stops
+// with "InternalError: interrupted".
+void JsRuntime_set_interrupt(*JsRuntime self, escaping JsInterruptFn f) {
+    if (self.has_interrupt) free_closure(self.interrupt);
+    self.interrupt = f;
+    self.has_interrupt = true;
+    eq_use_interrupt(self.handle, 1);
+}
+
+// Removes the interrupt handler set by set_interrupt.
+void JsRuntime_clear_interrupt(*JsRuntime self) {
+    eq_use_interrupt(self.handle, 0);
+    if (self.has_interrupt) free_closure(self.interrupt);
+    self.has_interrupt = false;
+}
+
+// Loads imported modules through `resolve` and `load` (see JsResolveFn and JsLoadFn).
+void JsRuntime_set_loader(*JsRuntime self, escaping JsResolveFn resolve, escaping JsLoadFn load) {
+    if (self.has_resolver) free_closure(self.resolver);
+    if (self.has_loader) free_closure(self.loader);
+    self.resolver = resolve;
+    self.loader = load;
+    self.has_resolver = true;
+    self.has_loader = true;
+    self.fs_loader = false;
+    eq_use_module_loader(self.handle, 1);
+}
+
+// Loads imported modules from files under `root`, as js_fs_resolve resolves them.
+void JsRuntime_set_fs_loader(*JsRuntime self, string root) {
+    if (self.has_resolver) free_closure(self.resolver);
+    if (self.has_loader) free_closure(self.loader);
+    self.has_resolver = false;
+    self.has_loader = false;
+    String_clear(&self.root);
+    js_path_normalize(root, &self.root);
+    self.fs_loader = true;
+    eq_use_module_loader(self.handle, 1);
+}
+
+// The runtime's memory figures.
+JsMemory JsRuntime_memory(*JsRuntime self) {
+    int64[8] v;
+    eq_memory_usage(self.handle, &v[0]);
+    let m: JsMemory;
+    m.malloc_size = v[0];
+    m.malloc_limit = v[1];
+    m.malloc_count = v[2];
+    m.objects = v[3];
+    m.strings = v[4];
+    m.atoms = v[5];
+    m.functions = v[6];
+    m.used = v[7];
+    return m;
+}
+
+// True while promise jobs wait to run (JsContext.run_jobs runs them).
+bool JsRuntime_jobs_pending(*JsRuntime self) {
+    return eq_jobs_pending(self.handle) != 0;
+}
+
+// A new context with the standard global objects.
+Result<JsContext, string> JsRuntime_context(*JsRuntime self) {
+    let c: JsContext;
+    c.rt = self;
+    c.handle = eq_context_new(self.handle);
+    if (c.handle == null) return Err<JsContext, string>("quickjs: could not create a context (out of memory)");
+    return Ok<JsContext, string>(c);
+}
+
+// --- module paths -----------------------------------------------------------
+
+// Appends `path` to out with "." and ".." segments folded and "\" as "/".
+void js_path_normalize(string path, String* out) {
+    let parts: List<String>;
+    List_init<String>(&parts, 16);
+    int64 n = strlen(path);
+    bool absolute = n > 0 && (path[0] == '/' || path[0] == '\\');
+    String prefix;
+    String_init(&prefix, 4);
+    int64 i = 0;
+    // a Windows drive ("C:")
+    if (n >= 2 && path[1] == ':') {
+        prefix.push(path[0]);
+        prefix.push(':');
+        i = 2;
+        absolute = n > 2 && (path[2] == '/' || path[2] == '\\');
+    }
+    while (i < n) {
+        while (i < n && (path[i] == '/' || path[i] == '\\')) i++;
+        int64 start = i;
+        while (i < n && path[i] != '/' && path[i] != '\\') i++;
+        if (i == start) break;
+        let seg: String;
+        String_init(&seg, i - start + 1);
+        seg.append_bytes(&path[start], i - start);
+        if (seg == ".") {
+            seg.free();
+        } else if (seg == "..") {
+            if (parts.size > 0 && !(parts.data[parts.size - 1] == "..")) {
+                String last = List_pop<String>(&parts);
+                last.free();
+                seg.free();
+            } else if (absolute) {
+                seg.free();
+            } else {
+                parts.push(seg);
+            }
+        } else {
+            parts.push(seg);
+        }
+    }
+    out.append(prefix.cstr());
+    prefix.free();
+    if (absolute) out.append("/");
+    for (k in 0..parts.size) {
+        if (k > 0) out.append("/");
+        out.append(parts.data[k].cstr());
+        parts.data[k].free();
+    }
+    List_free<String>(&parts);
+    if (out.len == 0) out.append(".");
+}
+
+// The module resolution Tallgrass and most embedders use: a name starting with "."
+// is relative to the importing module's directory, any other name to `root`; ".js"
+// is added to a name whose last segment has no extension; the result is normalized
+// (js_path_normalize) and must be an existing file.
+bool js_fs_resolve(string root, string base, string name, *String out) {
+    let joined: String;
+    String_init(&joined, 128);
+    defer joined.free();
+    if (name[0] == '.') {
+        int64 cut = -1;
+        int64 bl = strlen(base);
+        for (i in 0..bl) {
+            if (base[i] == '/' || base[i] == '\\') cut = i;
+        }
+        if (cut >= 0) {
+            joined.append_bytes(base, cut);
+            joined.append("/");
+        }
+        joined.append(name);
+    } else if (name[0] == '/' || (strlen(name) > 2 && name[1] == ':')) {
+        joined.append(name);
+    } else {
+        joined.append(root);
+        joined.append("/");
+        joined.append(name);
+    }
+    // an extension in the last segment?
+    bool ext = false;
+    for (i in 0..joined.len) {
+        char ch = joined.data[i];
+        if (ch == '/' || ch == '\\') ext = false;
+        else if (ch == '.') ext = true;
+    }
+    // a "." or ".." segment is not an extension
+    if (joined.ends_with("/.") != 0 || joined.ends_with("/..") != 0) ext = false;
+    if (!ext) joined.append(".js");
+    int64 mark = out.len;
+    js_path_normalize(joined.cstr(), out);
+    if (fs_is_file(out.cstr()) != 1) {
+        out.data[mark] = 0;
+        out.len = mark;
+        return false;
+    }
+    return true;
+}
+
+// --- errors -----------------------------------------------------------------
+
+// The last exception a Result reported, split into fields.
+*JsError js_last_error() {
+    _js_init();
+    return &_js_last;
+}
+
+// Reads file:line:col out of one stack frame line ("    at f (a.js:3:9)", "    at a.js:3:9").
+void _js_frame(*char line, int64 n) {
+    int64 open = -1;
+    int64 close = n;
+    for (i in 0..n) {
+        if (line[i] == '(' && open < 0) open = i;
+    }
+    int64 start = 0;
+    if (open >= 0) {
+        start = open + 1;
+        for (i in start..n) {
+            if (line[i] == ')') { close = i; break; }
+        }
+    } else {
+        // "    at file:line:col"
+        int64 at = 0;
+        while (at < n && line[at] == ' ') at++;
+        if (at + 3 <= n && line[at] == 'a' && line[at + 1] == 't' && line[at + 2] == ' ') start = at + 3;
+        else return;
+    }
+    // the last two ":" in [start, close) are line and column (a column is optional)
+    int64 c1 = -1;
+    int64 c2 = -1;
+    for (i in start..close) {
+        if (line[i] == ':') { c1 = c2; c2 = i; }
+    }
+    if (c2 < 0) return;
+    int64 colon = c2;
+    int col = 0;
+    // "file:line:col" or "file:line"
+    bool digits_after = true;
+    for (i in (c2 + 1)..close) {
+        if (line[i] < '0' || line[i] > '9') digits_after = false;
+    }
+    if (!digits_after) return;
+    if (c1 >= 0) {
+        bool both = true;
+        for (i in (c1 + 1)..c2) {
+            if (line[i] < '0' || line[i] > '9') both = false;
+        }
+        if (both && c2 > c1 + 1) {
+            for (i in (c2 + 1)..close) col = col * 10 + (int)(line[i] - '0');
+            colon = c1;
+        }
+    }
+    int ln = 0;
+    int64 lend = colon == c1 ? c2 : close;
+    for (i in (colon + 1)..lend) ln = ln * 10 + (int)(line[i] - '0');
+    if (colon <= start || ln == 0) return;
+    if (line[start] == '<') return;   // "<native>", "<eval>" without a file
+    String_clear(&_js_last.file);
+    _js_last.file.append_bytes(&line[start], colon - start);
+    _js_last.line = ln;
+    _js_last.column = col;
+}
+
+void _js_text_of(*JSContext c, *JSValue v, String* out) {
+    int64 n = 0;
+    *char s = eq_to_cstring(c, v, &n);
+    if (s == null) {
+        let e: JSValue;
+        eq_take_exception(c, &e);
+        eq_free(c, &e);
+        out.append("(value not convertible to a string)");
+        return;
+    }
+    out.append_bytes(s, n);
+    eq_free_cstring(c, s);
+}
+
+// Takes the pending exception of `c` into _js_last and returns it as text.
+string _js_take_error(*JSContext c) {
+    _js_init();
+    let e: JSValue;
+    eq_take_exception(c, &e);
+    String_clear(&_js_last.name);
+    String_clear(&_js_last.message);
+    String_clear(&_js_last.stack);
+    String_clear(&_js_last.file);
+    _js_last.line = 0;
+    _js_last.column = 0;
+    _js_last.interrupted = eq_was_interrupted(eq_context_runtime(c)) != 0;
+    int k = eq_kind(c, &e);
+    if (k == EQ_ERROR || k == EQ_OBJECT) {
+        let part: JSValue;
+        eq_get(c, &e, "name", &part);
+        if (eq_kind(c, &part) == EQ_STRING) _js_text_of(c, &part, &_js_last.name);
+        eq_free(c, &part);
+        eq_get(c, &e, "message", &part);
+        if (eq_kind(c, &part) != EQ_UNDEFINED) _js_text_of(c, &part, &_js_last.message);
+        eq_free(c, &part);
+        eq_get(c, &e, "stack", &part);
+        if (eq_kind(c, &part) == EQ_STRING) _js_text_of(c, &part, &_js_last.stack);
+        eq_free(c, &part);
+        if (k == EQ_OBJECT && _js_last.name.len == 0 && _js_last.message.len == 0) {
+            _js_text_of(c, &e, &_js_last.message);
+        }
+    } else if (k == EQ_NULL && !_js_last.interrupted) {
+        _js_last.message.append("exception without a value (out of memory?)");
+    } else {
+        _js_text_of(c, &e, &_js_last.message);
+    }
+    eq_free(c, &e);
+    // the first frame that names a file
+    int64 i = 0;
+    while (i < _js_last.stack.len && _js_last.file.len == 0) {
+        int64 j = i;
+        while (j < _js_last.stack.len && _js_last.stack.data[j] != '\n') j++;
+        _js_frame(&_js_last.stack.data[i], j - i);
+        i = j + 1;
+    }
+    String_clear(&_js_err);
+    if (_js_last.name.len > 0) {
+        _js_err.append(_js_last.name.cstr());
+        _js_err.append(": ");
+    }
+    _js_err.append(_js_last.message.cstr());
+    if (_js_last.stack.len > 0) {
+        _js_err.append("\n");
+        _js_err.append(_js_last.stack.cstr());
+        while (_js_err.len > 0 && _js_err.data[_js_err.len - 1] == '\n') {
+            _js_err.len--;
+            _js_err.data[_js_err.len] = 0;
+        }
+    }
+    return _js_err.data;
+}
+
+// --- context ----------------------------------------------------------------
+
+JsValue _js_value(*JSContext c, JSValue raw) {
+    let v: JsValue;
+    v.raw = raw;
+    v.ctx = c;
+    return v;
+}
+
+Result<JsValue, string> _js_result(*JSContext c, int rc, JSValue raw) {
+    if (rc < 0 || eq_is_exception(&raw) != 0) return Err<JsValue, string>(_js_take_error(c));
+    return Ok<JsValue, string>(_js_value(c, raw));
+}
+
+// Frees the context. Values of it still alive keep it until they are freed.
+void JsContext_release(*JsContext self) {
+    if (self.handle == null) return;
+    eq_context_free(self.handle);
+    self.handle = null;
+}
+
+// undefined.
+JsValue JsContext_undefined(*JsContext self) {
+    let r: JSValue;
+    eq_undefined(&r);
+    return _js_value(self.handle, r);
+}
+
+// null.
+JsValue JsContext_null(*JsContext self) {
+    let r: JSValue;
+    eq_null(&r);
+    return _js_value(self.handle, r);
+}
+
+// A number.
+JsValue JsContext_num(*JsContext self, double d) {
+    let r: JSValue;
+    eq_new_float64(self.handle, d, &r);
+    return _js_value(self.handle, r);
+}
+
+// A number from an integer (stored as a 32-bit integer when it fits, as QuickJS does).
+JsValue JsContext_int(*JsContext self, int64 n) {
+    let r: JSValue;
+    eq_new_int64(self.handle, n, &r);
+    return _js_value(self.handle, r);
+}
+
+// true or false.
+JsValue JsContext_boolean(*JsContext self, bool b) {
+    let r: JSValue;
+    eq_new_bool(self.handle, b ? 1 : 0, &r);
+    return _js_value(self.handle, r);
+}
+
+// A string from UTF-8 text (null gives "").
+JsValue JsContext_str(*JsContext self, string s) {
+    let r: JSValue;
+    eq_new_string(self.handle, s, -1, &r);
+    return _js_value(self.handle, r);
+}
+
+// A string from `n` bytes of UTF-8, which may hold NULs.
+JsValue JsContext_str_len(*JsContext self, *char s, int64 n) {
+    let r: JSValue;
+    eq_new_string(self.handle, s, n, &r);
+    return _js_value(self.handle, r);
+}
+
+// A new empty object.
+JsValue JsContext_object(*JsContext self) {
+    let r: JSValue;
+    eq_new_object(self.handle, &r);
+    return _js_value(self.handle, r);
+}
+
+// A new empty array.
+JsValue JsContext_array(*JsContext self) {
+    let r: JSValue;
+    eq_new_array(self.handle, &r);
+    return _js_value(self.handle, r);
+}
+
+// An array of `n` numbers.
+JsValue JsContext_num_array(*JsContext self, *double d, int n) {
+    JsValue a = JsContext_array(self);
+    for (i in 0..n) {
+        let x: JSValue;
+        eq_new_float64(self.handle, d[i], &x);
+        eq_set_index(self.handle, &a.raw, (int64)i, &x);
+    }
+    return a;
+}
+
+// An array of the strings of a list.
+JsValue JsContext_str_array(*JsContext self, *List<String> items) {
+    JsValue a = JsContext_array(self);
+    for (i in 0..items.size) {
+        let x: JSValue;
+        eq_new_string(self.handle, items.data[i].data, items.data[i].len, &x);
+        eq_set_index(self.handle, &a.raw, (int64)i, &x);
+    }
+    return a;
+}
+
+// A typed array of `kind` (JS_U8 ... JS_F64) holding a copy of `bytes` bytes.
+JsValue JsContext_typed_array(*JsContext self, int kind, *void data, int64 bytes) {
+    let r: JSValue;
+    eq_new_typed_array(self.handle, kind, data, bytes, &r);
+    return _js_value(self.handle, r);
+}
+
+// An ArrayBuffer holding a copy of `bytes` bytes.
+JsValue JsContext_array_buffer(*JsContext self, *void data, int64 bytes) {
+    let r: JSValue;
+    eq_new_array_buffer(self.handle, data, bytes, &r);
+    return _js_value(self.handle, r);
+}
+
+// A JavaScript function that runs `f`. `length` is its declared parameter count
+// (Function.prototype.length); the closure lives as long as the runtime.
+JsValue JsContext_function(*JsContext self, string name, int length, escaping JsFn f) {
+    let h: _JsHostFn;
+    h.f = f;
+    int id = self.rt.fns.size;
+    self.rt.fns.push(h);
+    let r: JSValue;
+    eq_new_function(self.handle, name, length, id, &r);
+    return _js_value(self.handle, r);
+}
+
+// The global object.
+JsValue JsContext_global(*JsContext self) {
+    let r: JSValue;
+    eq_global(self.handle, &r);
+    return _js_value(self.handle, r);
+}
+
+// globalThis[name] (undefined when missing).
+JsValue JsContext_get_global(*JsContext self, string name) {
+    JsValue g = JsContext_global(self);
+    JsValue v = g.get(name);
+    g.free();
+    return v;
+}
+
+// Sets globalThis[name], consuming `v`.
+bool JsContext_set_global(*JsContext self, string name, JsValue v) {
+    JsValue g = JsContext_global(self);
+    bool ok = g.set(name, v);
+    g.free();
+    return ok;
+}
+
+// Throws an Error with `msg` and returns the exception marker for a host function
+// to return.
+JsValue JsContext_throw_error(*JsContext self, string msg) {
+    let r: JSValue;
+    eq_throw(self.handle, EQ_THROW_ERROR, msg, &r);
+    return _js_value(self.handle, r);
+}
+
+// Throws a TypeError with `msg` (see throw_error).
+JsValue JsContext_throw_type_error(*JsContext self, string msg) {
+    let r: JSValue;
+    eq_throw(self.handle, EQ_THROW_TYPE, msg, &r);
+    return _js_value(self.handle, r);
+}
+
+// Throws a RangeError with `msg` (see throw_error).
+JsValue JsContext_throw_range_error(*JsContext self, string msg) {
+    let r: JSValue;
+    eq_throw(self.handle, EQ_THROW_RANGE, msg, &r);
+    return _js_value(self.handle, r);
+}
+
+// Throws `v` itself, consuming it (see throw_error).
+JsValue JsContext_throw_value(*JsContext self, JsValue v) {
+    let r: JSValue;
+    eq_throw_value(self.handle, &v.raw, &r);
+    return _js_value(self.handle, r);
+}
+
+// Takes the exception pending in this context (after a value of kind JS_EXCEPTION)
+// and returns it as text, as a failed Result would.
+string JsContext_take_error(*JsContext self) {
+    return _js_take_error(self.handle);
+}
+
+// Evaluates `src` as a classic script named `file` (for stack traces) and returns
+// its completion value.
+Result<JsValue, string> JsContext_eval(*JsContext self, string src, string file) {
+    let r: JSValue;
+    int rc = eq_eval(self.handle, src, -1, file, 0, &r);
+    return _js_result(self.handle, rc, r);
+}
+
+// Evaluates `src` as the ES module `name`, loading its imports through the runtime's
+// loader and running jobs until it settles (top-level await included). Returns the
+// module's namespace object (its exports). `name` is what relative imports resolve
+// against, normally the module's resolved path.
+Result<JsValue, string> JsContext_eval_module(*JsContext self, string name, string src) {
+    let r: JSValue;
+    int rc = eq_eval_module(self.handle, src, -1, name, &r);
+    return _js_result(self.handle, rc, r);
+}
+
+// Reads the file at `path` and evaluates it as an ES module named by its normalized
+// path (see eval_module).
+Result<JsValue, string> JsContext_eval_file(*JsContext self, string path) {
+    let src: String;
+    String_init(&src, 4096);
+    defer src.free();
+    let name: String;
+    String_init(&name, 128);
+    defer name.free();
+    js_path_normalize(path, &name);
+    if (fs_read_text(name.cstr(), &src) != 0) {
+        String_clear(&_js_err);
+        String_appendf(&_js_err, "quickjs: could not read %s", name.cstr());
+        return Err<JsValue, string>(_js_err.data);
+    }
+    let r: JSValue;
+    int rc = eq_eval_module(self.handle, src.data, src.len, name.cstr(), &r);
+    return _js_result(self.handle, rc, r);
+}
+
+// Imports module `name` through the loader (resolved against "" as the base) and
+// returns its namespace. A module already loaded is not evaluated again.
+Result<JsValue, string> JsContext_import(*JsContext self, string name) {
+    let r: JSValue;
+    int rc = eq_import(self.handle, name, &r);
+    return _js_result(self.handle, rc, r);
+}
+
+// Calls `f` with `this` (null for undefined) and `n` arguments, which stay owned by
+// the caller.
+Result<JsValue, string> JsContext_call(*JsContext self, *JsValue f, *JsValue this_val, *JsValue args, int n) {
+    // the arguments as a C array of JSValue
+    *JSValue argv = alloc<JSValue>((int64)(n > 0 ? n : 1));
+    for (i in 0..n) argv[i] = args[i].raw;
+    let r: JSValue;
+    int rc = eq_call(self.handle, &f.raw, this_val == null ? null : &this_val.raw, n, argv, &r);
+    free((*void)argv);
+    return _js_result(self.handle, rc, r);
+}
+
+// Calls the global function `name` (as globalThis.onUpdate(dt)). A missing name or a
+// value that is not a function is an error.
+Result<JsValue, string> JsContext_call_global(*JsContext self, string name, *JsValue args, int n) {
+    JsValue f = JsContext_get_global(self, name);
+    defer f.free();
+    if (f.kind() == JS_EXCEPTION) return Err<JsValue, string>(_js_take_error(self.handle));
+    if (f.kind() != JS_FUNCTION) {
+        String_clear(&_js_err);
+        String_appendf(&_js_err, "TypeError: %s is not a function", name);
+        return Err<JsValue, string>(_js_err.data);
+    }
+    return JsContext_call(self, &f, null, args, n);
+}
+
+// Calls the global function `name` when the script defines one (as onBoot, onWarp);
+// returns undefined when it does not.
+Result<JsValue, string> JsContext_call_global_opt(*JsContext self, string name, *JsValue args, int n) {
+    JsValue f = JsContext_get_global(self, name);
+    if (f.kind() != JS_FUNCTION) {
+        f.free();
+        return Ok<JsValue, string>(JsContext_undefined(self));
+    }
+    defer f.free();
+    return JsContext_call(self, &f, null, args, n);
+}
+
+// Calls `f` as a constructor (new f(...args)).
+Result<JsValue, string> JsContext_construct(*JsContext self, *JsValue f, *JsValue args, int n) {
+    *JSValue argv = alloc<JSValue>((int64)(n > 0 ? n : 1));
+    for (i in 0..n) argv[i] = args[i].raw;
+    let r: JSValue;
+    int rc = eq_construct(self.handle, &f.raw, n, argv, &r);
+    free((*void)argv);
+    return _js_result(self.handle, rc, r);
+}
+
+// Parses JSON text (JSON.parse).
+Result<JsValue, string> JsContext_parse_json(*JsContext self, string text) {
+    let r: JSValue;
+    int rc = eq_parse_json(self.handle, text, -1, "<json>", &r);
+    return _js_result(self.handle, rc, r);
+}
+
+// Runs pending promise jobs and returns how many ran, or the first job's exception.
+Result<int, string> JsContext_run_jobs(*JsContext self) {
+    *JSContext failed = null;
+    int n = eq_run_jobs(eq_context_runtime(self.handle), &failed);
+    if (n < 0) return Err<int, string>(_js_take_error(failed != null ? failed : self.handle));
+    return Ok<int, string>(n);
+}
+
+// Settles a promise by running jobs, consuming it, and returns its value; a rejected
+// promise is an error with its reason. A value that is not a promise comes back as is.
+Result<JsValue, string> JsContext_await(*JsContext self, JsValue promise) {
+    let r: JSValue;
+    int rc = eq_await(self.handle, &promise.raw, &r);
+    return _js_result(self.handle, rc, r);
+}
+
+// --- values -----------------------------------------------------------------
+
+// Frees the value (a no-op for numbers, booleans, null and undefined).
+void JsValue_free(*JsValue self) {
+    if (self.ctx == null) return;
+    eq_free(self.ctx, &self.raw);
+}
+
+// The context the value belongs to (a handle: releasing it releases that context).
+JsContext JsValue_context(*JsValue self) {
+    let c: JsContext;
+    c.handle = self.ctx;
+    c.rt = (*JsRuntime)eq_context_host(self.ctx);
+    return c;
+}
+
+// A second reference to the same value, freed separately.
+JsValue JsValue_dup(*JsValue self) {
+    let r: JSValue;
+    eq_dup(self.ctx, &self.raw, &r);
+    return _js_value(self.ctx, r);
+}
+
+// The value's kind: JS_UNDEFINED, JS_NULL, JS_BOOL, JS_NUMBER, JS_STRING, JS_SYMBOL,
+// JS_BIGINT, JS_OBJECT, JS_ARRAY, JS_FUNCTION, JS_ERROR or JS_EXCEPTION.
+int JsValue_kind(*JsValue self) {
+    return eq_kind(self.ctx, &self.raw);
+}
+
+// True for undefined.
+bool JsValue_is_undefined(*JsValue self) { return JsValue_kind(self) == JS_UNDEFINED; }
+// True for null.
+bool JsValue_is_null(*JsValue self) { return JsValue_kind(self) == JS_NULL; }
+// True for undefined and null, the values an optional argument treats as missing.
+bool JsValue_is_nullish(*JsValue self) {
+    int k = JsValue_kind(self);
+    return k == JS_UNDEFINED || k == JS_NULL;
+}
+// True for a number.
+bool JsValue_is_number(*JsValue self) { return JsValue_kind(self) == JS_NUMBER; }
+// True for a string.
+bool JsValue_is_string(*JsValue self) { return JsValue_kind(self) == JS_STRING; }
+// True for true and false.
+bool JsValue_is_bool(*JsValue self) { return JsValue_kind(self) == JS_BOOL; }
+// True for an array.
+bool JsValue_is_array(*JsValue self) { return JsValue_kind(self) == JS_ARRAY; }
+// True for a function (anything callable).
+bool JsValue_is_function(*JsValue self) { return JsValue_kind(self) == JS_FUNCTION; }
+// True for any object: plain objects, arrays, functions and errors.
+bool JsValue_is_object(*JsValue self) {
+    int k = JsValue_kind(self);
+    return k == JS_OBJECT || k == JS_ARRAY || k == JS_FUNCTION || k == JS_ERROR;
+}
+// True for the exception marker: the operation that made the value threw, and the
+// exception is pending in the context (JsContext.take_error takes it).
+bool JsValue_is_exception(*JsValue self) { return eq_is_exception(&self.raw) != 0; }
+
+// The value as a number (ToNumber); NaN when the conversion throws.
+double JsValue_as_number(*JsValue self) {
+    double d = 0.0;
+    if (eq_to_float64(self.ctx, &self.raw, &d) < 0) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return 0.0 / 0.0;
+    }
+    return d;
+}
+
+// The value as a 32-bit integer (ToInt32: truncated, wrapped); 0 when it throws.
+int JsValue_as_int(*JsValue self) {
+    int n = 0;
+    if (eq_to_int32(self.ctx, &self.raw, &n) < 0) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return 0;
+    }
+    return n;
+}
+
+// The value as a 64-bit integer (truncated, saturated); 0 when it throws.
+int64 JsValue_as_int64(*JsValue self) {
+    int64 n = 0;
+    if (eq_to_int64(self.ctx, &self.raw, &n) < 0) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return 0;
+    }
+    return n;
+}
+
+// The value's truthiness (ToBoolean).
+bool JsValue_as_bool(*JsValue self) {
+    return eq_to_bool(self.ctx, &self.raw) > 0;
+}
+
+// Appends the value as UTF-8 text (ToString) to out; false when the conversion
+// throws (the exception is discarded).
+bool JsValue_as_string(*JsValue self, String* out) {
+    int64 n = 0;
+    *char s = eq_to_cstring(self.ctx, &self.raw, &n);
+    if (s == null) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return false;
+    }
+    out.append_bytes(s, n);
+    eq_free_cstring(self.ctx, s);
+    return true;
+}
+
+// The value as a new String (ToString), owned by the caller.
+String JsValue_to_string(*JsValue self) {
+    let s: String;
+    String_init(&s, 16);
+    JsValue_as_string(self, &s);
+    return s;
+}
+
+// Appends JSON.stringify(value, null, indent) to out; false when it throws or the
+// value has no JSON form (undefined, a function).
+bool JsValue_to_json(*JsValue self, int indent, String* out) {
+    let r: JSValue;
+    if (eq_stringify(self.ctx, &self.raw, indent, &r) < 0) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return false;
+    }
+    bool ok = eq_kind(self.ctx, &r) == EQ_STRING;
+    if (ok) {
+        JsValue s = _js_value(self.ctx, r);
+        JsValue_as_string(&s, out);
+    }
+    eq_free(self.ctx, &r);
+    return ok;
+}
+
+// The data of a typed array, DataView or ArrayBuffer and its size in bytes, or null
+// for any other value. The pointer is valid while the value is alive.
+*uint8 JsValue_bytes(*JsValue self, *int64 len) {
+    return eq_buffer_data(self.ctx, &self.raw, len);
+}
+
+// value[name] (undefined when missing; a getter that throws gives a JS_EXCEPTION value).
+JsValue JsValue_get(*JsValue self, string name) {
+    let r: JSValue;
+    eq_get(self.ctx, &self.raw, name, &r);
+    return _js_value(self.ctx, r);
+}
+
+// value[name] as a number (NaN when missing or not convertible).
+double JsValue_get_num(*JsValue self, string name) {
+    JsValue v = JsValue_get(self, name);
+    double d = v.is_exception() ? 0.0 / 0.0 : JsValue_as_number(&v);
+    if (v.is_exception()) { let e: JSValue; eq_take_exception(self.ctx, &e); eq_free(self.ctx, &e); }
+    v.free();
+    return d;
+}
+
+// Appends value[name] as text to out; false when it is missing (undefined) or throws.
+bool JsValue_get_str(*JsValue self, string name, String* out) {
+    JsValue v = JsValue_get(self, name);
+    bool ok = false;
+    if (v.is_exception()) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+    } else if (!v.is_undefined()) {
+        ok = JsValue_as_string(&v, out);
+    }
+    v.free();
+    return ok;
+}
+
+// value[i].
+JsValue JsValue_at(*JsValue self, int64 i) {
+    let r: JSValue;
+    eq_get_index(self.ctx, &self.raw, i, &r);
+    return _js_value(self.ctx, r);
+}
+
+// value[name] = v, consuming v. False when it throws (the exception stays pending).
+bool JsValue_set(*JsValue self, string name, JsValue v) {
+    return eq_set(self.ctx, &self.raw, name, &v.raw) == 0;
+}
+
+// value[name] = d.
+bool JsValue_set_num(*JsValue self, string name, double d) {
+    let x: JSValue;
+    eq_new_float64(self.ctx, d, &x);
+    return eq_set(self.ctx, &self.raw, name, &x) == 0;
+}
+
+// value[name] = s (UTF-8 text).
+bool JsValue_set_str(*JsValue self, string name, string s) {
+    let x: JSValue;
+    eq_new_string(self.ctx, s, -1, &x);
+    return eq_set(self.ctx, &self.raw, name, &x) == 0;
+}
+
+// value[name] = b.
+bool JsValue_set_bool(*JsValue self, string name, bool b) {
+    let x: JSValue;
+    eq_new_bool(self.ctx, b ? 1 : 0, &x);
+    return eq_set(self.ctx, &self.raw, name, &x) == 0;
+}
+
+// value[name] = a host function named `name` running `f` (see JsContext.function).
+bool JsValue_set_fn(*JsValue self, string name, int length, escaping JsFn f) {
+    JsContext c = JsValue_context(self);
+    JsValue fv = JsContext_function(&c, name, length, f);
+    return JsValue_set(self, name, fv);
+}
+
+// value[i] = v, consuming v.
+bool JsValue_set_at(*JsValue self, int64 i, JsValue v) {
+    return eq_set_index(self.ctx, &self.raw, i, &v.raw) == 0;
+}
+
+// Appends v to an array, consuming v.
+bool JsValue_push(*JsValue self, JsValue v) {
+    int64 n = JsValue_length(self);
+    return eq_set_index(self.ctx, &self.raw, n, &v.raw) == 0;
+}
+
+// True when the object has property `name` (own or inherited).
+bool JsValue_has(*JsValue self, string name) {
+    return eq_has(self.ctx, &self.raw, name) > 0;
+}
+
+// Deletes property `name`; false when it cannot be deleted.
+bool JsValue_delete(*JsValue self, string name) {
+    return eq_delete(self.ctx, &self.raw, name) > 0;
+}
+
+// value.length (0 when missing).
+int64 JsValue_length(*JsValue self) {
+    int64 n = 0;
+    if (eq_length(self.ctx, &self.raw, &n) < 0) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return 0;
+    }
+    return n;
+}
+
+// Appends the object's own enumerable string keys to out (as Object.keys). Each
+// String is owned by the caller.
+void JsValue_keys(*JsValue self, *List<String> out) {
+    let r: JSValue;
+    if (eq_keys(self.ctx, &self.raw, &r) < 0) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return;
+    }
+    JsValue arr = _js_value(self.ctx, r);
+    int64 n = JsValue_length(&arr);
+    for (i in 0..n) {
+        JsValue k = JsValue_at(&arr, i);
+        out.push(JsValue_to_string(&k));
+        k.free();
+    }
+    arr.free();
+}
+
+// Appends the elements of an array as numbers to out.
+void JsValue_numbers(*JsValue self, *List<double> out) {
+    int64 n = JsValue_length(self);
+    for (i in 0..n) {
+        JsValue x = JsValue_at(self, i);
+        out.push(JsValue_as_number(&x));
+        x.free();
+    }
+}
+
+// Calls the value as a function with `this` undefined and `n` arguments (borrowed).
+Result<JsValue, string> JsValue_call(*JsValue self, *JsValue args, int n) {
+    JsContext c = JsValue_context(self);
+    return JsContext_call(&c, self, null, args, n);
+}
+
+// Calls method `name` of the value with `n` arguments (borrowed).
+Result<JsValue, string> JsValue_call_method(*JsValue self, string name, *JsValue args, int n) {
+    JsContext c = JsValue_context(self);
+    JsValue f = JsValue_get(self, name);
+    defer f.free();
+    if (f.is_exception()) return Err<JsValue, string>(_js_take_error(self.ctx));
+    if (!f.is_function()) {
+        String_clear(&_js_err);
+        String_appendf(&_js_err, "TypeError: %s is not a function", name);
+        return Err<JsValue, string>(_js_err.data);
+    }
+    return JsContext_call(&c, &f, self, args, n);
+}
+
+// --- host function arguments ------------------------------------------------
+
+// The number of arguments the script passed.
+int JsArgs_len(*JsArgs self) {
+    return self.argc;
+}
+
+// Argument i, borrowed (undefined past the last one). dup() it to keep it, as a
+// callback to call later.
+JsValue JsArgs_at(*JsArgs self, int i) {
+    if (i < 0 || i >= self.argc) {
+        let r: JSValue;
+        eq_undefined(&r);
+        return _js_value(self.ctx, r);
+    }
+    return _js_value(self.ctx, self.argv[i]);
+}
+
+// `this` of the call, borrowed.
+JsValue JsArgs_this(*JsArgs self) {
+    return _js_value(self.ctx, *self.this_raw);
+}
+
+// True when argument i was passed and is not undefined or null.
+bool JsArgs_has(*JsArgs self, int i) {
+    JsValue v = JsArgs_at(self, i);
+    return !v.is_nullish();
+}
+
+// Argument i as a number (NaN when missing).
+double JsArgs_num(*JsArgs self, int i) {
+    JsValue v = JsArgs_at(self, i);
+    return JsValue_as_number(&v);
+}
+
+// Argument i as a number, or `def` when it is missing, undefined or null.
+double JsArgs_opt_num(*JsArgs self, int i, double def) {
+    if (!JsArgs_has(self, i)) return def;
+    return JsArgs_num(self, i);
+}
+
+// Argument i as a 32-bit integer (ToInt32).
+int JsArgs_int(*JsArgs self, int i) {
+    JsValue v = JsArgs_at(self, i);
+    return JsValue_as_int(&v);
+}
+
+// Argument i as a 32-bit integer, or `def` when it is missing, undefined or null.
+int JsArgs_opt_int(*JsArgs self, int i, int def) {
+    if (!JsArgs_has(self, i)) return def;
+    return JsArgs_int(self, i);
+}
+
+// Argument i's truthiness.
+bool JsArgs_flag(*JsArgs self, int i) {
+    JsValue v = JsArgs_at(self, i);
+    return JsValue_as_bool(&v);
+}
+
+// Argument i as UTF-8 text (ToString), valid until the host function returns; ""
+// when it does not convert.
+string JsArgs_str(*JsArgs self, int i) {
+    JsValue v = JsArgs_at(self, i);
+    int64 n = 0;
+    *char s = eq_to_cstring(self.ctx, &v.raw, &n);
+    if (s == null) {
+        let e: JSValue;
+        eq_take_exception(self.ctx, &e);
+        eq_free(self.ctx, &e);
+        return "";
+    }
+    self.strs.push(s);
+    return s;
+}
+
+// Argument i as text, or `def` when it is missing, undefined or null.
+string JsArgs_opt_str(*JsArgs self, int i, string def) {
+    if (!JsArgs_has(self, i)) return def;
+    return JsArgs_str(self, i);
+}
+
+// Appends the elements of array argument i as numbers to out.
+void JsArgs_numbers(*JsArgs self, int i, *List<double> out) {
+    JsValue v = JsArgs_at(self, i);
+    JsValue_numbers(&v, out);
+}
+
+// Every argument from i on as a number (a rest parameter, ...nums).
+void JsArgs_rest_nums(*JsArgs self, int i, *List<double> out) {
+    for (k in i..self.argc) out.push(JsArgs_num(self, k));
+}
+
+// A new reference to argument i, owned by the caller (to keep a callback).
+JsValue JsArgs_dup(*JsArgs self, int i) {
+    JsValue v = JsArgs_at(self, i);
+    return JsValue_dup(&v);
+}

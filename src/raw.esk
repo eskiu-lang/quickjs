@@ -1,0 +1,147 @@
+// raw.esk: the C functions of native/eskqjs.h (<quickjs/raw>).
+//
+// QuickJS itself keeps much of its API inline and passes JSValue by value; eskqjs
+// exports the same operations as plain functions over JSValue pointers. <quickjs>
+// is built on these; use them for what it does not cover. Ownership follows the
+// header: a JSValue written through an out pointer belongs to the caller, a
+// "consumed" argument is freed by the call.
+
+#if defined(__wasm__)
+#error "quickjs: on the web, run scripts in the browser's own JavaScript engine (see docs/README.md)"
+#endif
+#if !(defined(__x86_64__) || defined(__aarch64__))
+#error "quickjs: the prebuilt QuickJS libraries are 64-bit x86 and Arm only"
+#endif
+
+#pragma link("eskqjs")
+#ifdef __linux__
+#pragma link("m")
+#ifndef __ANDROID__
+#pragma link("pthread")
+#endif
+#endif
+#ifdef _WIN32
+#pragma link("pthread")
+#endif
+
+// The layout of JSValue on 64-bit targets: a payload word and a tag.
+struct JSValue {
+    uint64 u;
+    int64 tag;
+}
+
+struct JSRuntime { int _opaque; }
+struct JSContext { int _opaque; }
+
+const int EQ_ABI_VERSION = 1;
+
+const int EQ_UNDEFINED = 0;
+const int EQ_NULL = 1;
+const int EQ_BOOL = 2;
+const int EQ_NUMBER = 3;
+const int EQ_STRING = 4;
+const int EQ_SYMBOL = 5;
+const int EQ_BIGINT = 6;
+const int EQ_OBJECT = 7;
+const int EQ_ARRAY = 8;
+const int EQ_FUNCTION = 9;
+const int EQ_ERROR = 10;
+const int EQ_EXCEPTION = 11;
+const int EQ_OTHER = 12;
+
+const int EQ_THROW_ERROR = 0;
+const int EQ_THROW_TYPE = 1;
+const int EQ_THROW_RANGE = 2;
+const int EQ_THROW_REFERENCE = 3;
+const int EQ_THROW_SYNTAX = 4;
+const int EQ_THROW_INTERNAL = 5;
+
+const int EQ_U8 = 0;
+const int EQ_I8 = 1;
+const int EQ_U16 = 2;
+const int EQ_I16 = 3;
+const int EQ_U32 = 4;
+const int EQ_I32 = 5;
+const int EQ_F32 = 6;
+const int EQ_F64 = 7;
+
+extern int eq_abi_version();
+extern string eq_quickjs_version();
+extern void eq_set_callbacks(fn(*void, *JSContext, int, *JSValue, int, *JSValue, *JSValue)->int call,
+                             fn(*void, string, string)->*char resolve,
+                             fn(*void, string, *int64)->*char load,
+                             fn(*void)->int interrupt);
+extern int64 eq_live_blocks();
+extern int64 eq_live_bytes();
+
+extern *JSRuntime eq_runtime_new(*void host);
+extern int64 eq_runtime_free(*JSRuntime rt);
+extern void eq_set_memory_limit(*JSRuntime rt, int64 bytes);
+extern void eq_set_max_stack_size(*JSRuntime rt, int64 bytes);
+extern void eq_update_stack_top(*JSRuntime rt);
+extern void eq_set_gc_threshold(*JSRuntime rt, int64 bytes);
+extern void eq_run_gc(*JSRuntime rt);
+extern void eq_set_time_limit(*JSRuntime rt, int64 ms);
+extern void eq_use_interrupt(*JSRuntime rt, int on);
+extern int eq_was_interrupted(*JSRuntime rt);
+extern void eq_use_module_loader(*JSRuntime rt, int on);
+extern void eq_memory_usage(*JSRuntime rt, *int64 out8);
+extern int eq_run_jobs(*JSRuntime rt, **JSContext err_ctx);
+extern int eq_jobs_pending(*JSRuntime rt);
+
+extern *JSContext eq_context_new(*JSRuntime rt);
+extern void eq_context_free(*JSContext ctx);
+extern *JSRuntime eq_context_runtime(*JSContext ctx);
+extern *void eq_context_host(*JSContext ctx);
+
+extern void eq_free(*JSContext ctx, *JSValue v);
+extern void eq_dup(*JSContext ctx, *JSValue v, *JSValue out);
+extern int eq_tag(*JSValue v);
+extern int eq_kind(*JSContext ctx, *JSValue v);
+extern int eq_is_exception(*JSValue v);
+extern void eq_undefined(*JSValue out);
+extern void eq_null(*JSValue out);
+extern void eq_exception(*JSValue out);
+extern void eq_new_bool(*JSContext ctx, int b, *JSValue out);
+extern void eq_new_int32(*JSContext ctx, int n, *JSValue out);
+extern void eq_new_int64(*JSContext ctx, int64 n, *JSValue out);
+extern void eq_new_float64(*JSContext ctx, double d, *JSValue out);
+extern int eq_new_string(*JSContext ctx, *char s, int64 len, *JSValue out);
+extern int eq_new_object(*JSContext ctx, *JSValue out);
+extern int eq_new_array(*JSContext ctx, *JSValue out);
+extern int eq_new_function(*JSContext ctx, string name, int length, int id, *JSValue out);
+extern int eq_new_typed_array(*JSContext ctx, int kind, *void data, int64 bytes, *JSValue out);
+extern int eq_new_array_buffer(*JSContext ctx, *void data, int64 bytes, *JSValue out);
+
+extern int eq_to_float64(*JSContext ctx, *JSValue v, *double out);
+extern int eq_to_int32(*JSContext ctx, *JSValue v, *int out);
+extern int eq_to_int64(*JSContext ctx, *JSValue v, *int64 out);
+extern int eq_to_bool(*JSContext ctx, *JSValue v);
+extern *char eq_to_cstring(*JSContext ctx, *JSValue v, *int64 len);
+extern void eq_free_cstring(*JSContext ctx, *char s);
+extern *uint8 eq_buffer_data(*JSContext ctx, *JSValue v, *int64 bytes);
+
+extern int eq_get(*JSContext ctx, *JSValue obj, string name, *JSValue out);
+extern int eq_set(*JSContext ctx, *JSValue obj, string name, *JSValue val);
+extern int eq_get_index(*JSContext ctx, *JSValue obj, int64 i, *JSValue out);
+extern int eq_set_index(*JSContext ctx, *JSValue obj, int64 i, *JSValue val);
+extern int eq_has(*JSContext ctx, *JSValue obj, string name);
+extern int eq_delete(*JSContext ctx, *JSValue obj, string name);
+extern int eq_length(*JSContext ctx, *JSValue obj, *int64 out);
+extern int eq_keys(*JSContext ctx, *JSValue obj, *JSValue out);
+extern void eq_global(*JSContext ctx, *JSValue out);
+extern int eq_define_const(*JSContext ctx, *JSValue obj, string name, *JSValue val);
+
+extern int eq_eval(*JSContext ctx, *char src, int64 len, string file, int flags, *JSValue out);
+extern int eq_eval_module(*JSContext ctx, *char src, int64 len, string name, *JSValue ns);
+extern int eq_import(*JSContext ctx, string name, *JSValue ns);
+extern int eq_call(*JSContext ctx, *JSValue f, *JSValue this_val, int argc, *JSValue argv, *JSValue out);
+extern int eq_construct(*JSContext ctx, *JSValue f, int argc, *JSValue argv, *JSValue out);
+extern int eq_parse_json(*JSContext ctx, *char text, int64 len, string file, *JSValue out);
+extern int eq_stringify(*JSContext ctx, *JSValue v, int indent, *JSValue out);
+extern int eq_await(*JSContext ctx, *JSValue promise, *JSValue out);
+
+extern void eq_throw(*JSContext ctx, int kind, string msg, *JSValue out);
+extern void eq_throw_value(*JSContext ctx, *JSValue val, *JSValue out);
+extern void eq_take_exception(*JSContext ctx, *JSValue out);
+extern int eq_has_exception(*JSContext ctx);
