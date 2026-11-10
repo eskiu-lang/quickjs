@@ -1,0 +1,86 @@
+// Ownership checks with the counting allocator under every runtime: many runtimes
+// built and released leave no block behind, and a value never freed is reported by
+// release() (objects) or by js_live_blocks() (strings) instead of going unnoticed.
+import <io>;
+import <mem>;
+import <string>;
+import <result>;
+import <quickjs>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+// A busy runtime: host functions, closures, modules, errors, values in both directions.
+void churn(int i) {
+    *JsRuntime rt = js_runtime().value;
+    rt.set_fs_loader("tests/data/game");
+    JsContext ctx = rt.context().value;
+    int calls = 0;
+    *int pc = &calls;
+    JsValue engine = ctx.object();
+    engine.set_fn("startX", 0, JsValue(*JsContext c, *JsArgs a) { *pc = *pc + 1; return c.num(1.0); });
+    engine.set_fn("log", 1, JsValue(*JsContext c, *JsArgs a) { a.str(0); return c.undefined(); });
+    engine.set_fn("setPos", 2, JsValue(*JsContext c, *JsArgs a) { return c.undefined(); });
+    ctx.set_global("engine", engine);
+    Result<JsValue, string> m = ctx.eval_file("tests/data/game/main.js");
+    if (m.ok) m.value.free();
+    else check("churn main.js", false);
+    JsValue dt = ctx.num(0.016);
+    for (k in 0..10) {
+        Result<JsValue, string> r = ctx.call_global("onUpdate", &dt, 1);
+        if (r.ok) r.value.free();
+    }
+    Result<JsValue, string> e = ctx.eval("null.x", "err.js");
+    check("churn error", !e.ok);
+    Result<JsValue, string> j = ctx.parse_json("{\"a\":[1,2,3]}");
+    if (j.ok) j.value.free();
+    ctx.release();
+    check("churn release", rt.release() == 0);
+    check("churn ran", calls == 1);
+}
+
+int main() {
+    for (i in 0..50) churn(i);
+    check("50 runtimes leave nothing", js_live_blocks() == 0 && js_live_bytes() == 0);
+
+    // two contexts in one runtime share host functions' runtime but not globals
+    *JsRuntime rt = js_runtime().value;
+    JsContext a = rt.context().value;
+    JsContext b = rt.context().value;
+    a.set_global("only_a", a.num(1.0));
+    Result<JsValue, string> ra = b.eval("typeof only_a", "b.js");
+    String s = ra.value.to_string();
+    check("contexts are separate", s == "undefined");
+    s.free();
+    ra.value.free();
+    a.release();
+    b.release();
+    check("two contexts released", rt.release() == 0 && js_live_blocks() == 0);
+
+    // an object never freed: release() reports it and keeps the heap
+    *JsRuntime leaky = js_runtime().value;
+    JsContext c = leaky.context().value;
+    Result<JsValue, string> kept = c.eval("({leak: [1, 2, 3]})", "leak.js");
+    check("leaky value", kept.ok);
+    c.release();
+    int64 leaked = leaky.release();
+    check("leaked objects are reported", leaked >= 2);
+    check("their blocks stay counted", js_live_blocks() > 0);
+
+    // a string never freed: no object, but its block stays counted
+    int64 before = js_live_blocks();
+    *JsRuntime srt = js_runtime().value;
+    JsContext sc = srt.context().value;
+    JsValue str = sc.str("a string nobody frees, long enough to be its own block");
+    sc.release();
+    check("a leaked string is no object", srt.release() == 0);
+    check("a leaked string stays counted", js_live_blocks() > before);
+    if (fails == 0) printf("leaks: ok\n");
+    return fails == 0 ? 0 : 1;
+}

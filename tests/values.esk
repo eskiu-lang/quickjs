@@ -1,0 +1,240 @@
+// Values in both directions: numbers, strings (UTF-8 and embedded NULs), booleans,
+// null and undefined, arrays, plain objects, JSON and typed arrays; kinds; dup and
+// free; and no allocation left once the runtime is released.
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <quickjs>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+// Evaluates `src` and returns the value (undefined with a failure on error).
+JsValue ev(*JsContext ctx, string src) {
+    Result<JsValue, string> r = ctx.eval(src, "values.js");
+    if (!r.ok) {
+        printf("FAIL eval %s: %s\n", src, r.error);
+        fails++;
+        return ctx.undefined();
+    }
+    return r.value;
+}
+
+bool str_is(*JsValue v, string want) {
+    String s = v.to_string();
+    bool ok = s == want;
+    if (!ok) printf("  got '%s', want '%s'\n", s.cstr(), want);
+    s.free();
+    return ok;
+}
+
+// The JSON text of v equals want.
+bool json_is(*JsValue v, string want) {
+    let s: String;
+    String_init(&s, 64);
+    bool ok = v.to_json(0, &s) && s == want;
+    if (!ok) printf("  json '%s', want '%s'\n", s.cstr(), want);
+    s.free();
+    return ok;
+}
+
+int main() {
+    Result<*JsRuntime, string> rr = js_runtime();
+    if (!rr.ok) { printf("FAIL runtime: %s\n", rr.error); return 1; }
+    *JsRuntime rt = rr.value;
+    Result<JsContext, string> cr = rt.context();
+    JsContext ctx = cr.value;
+
+    // JavaScript to Eskiu
+    JsValue n = ev(&ctx, "0.1 + 0.2");
+    check("number kind", n.kind() == JS_NUMBER);
+    check("number value", n.as_number() == 0.1 + 0.2);
+    n.free();
+    JsValue big = ev(&ctx, "2 ** 40 + 3");
+    check("int64", big.as_int64() == 1099511627779);
+    check("int32 wraps", big.as_int() == 3);
+    big.free();
+    JsValue neg = ev(&ctx, "-7.9");
+    check("int truncates", neg.as_int() == -7);
+    neg.free();
+    JsValue s = ev(&ctx, "'h\\u00e9llo ' + '\\u{1F600}'");
+    check("string kind", s.kind() == JS_STRING);
+    check("utf-8 out", str_is(&s, "h\xc3\xa9llo \xf0\x9f\x98\x80"));
+    s.free();
+    JsValue t = ev(&ctx, "1 < 2");
+    check("bool kind", t.kind() == JS_BOOL && t.as_bool());
+    t.free();
+    JsValue u = ev(&ctx, "undefined");
+    check("undefined", u.is_undefined() && u.is_nullish() && !u.as_bool());
+    JsValue nl = ev(&ctx, "null");
+    check("null", nl.is_null() && nl.is_nullish());
+    check("number to string", str_is(&nl, "null"));
+    JsValue arr = ev(&ctx, "[1, 2.5, 'x', [3]]");
+    check("array kind", arr.is_array() && arr.is_object());
+    check("array length", arr.length() == 4);
+    JsValue e1 = arr.at(1);
+    check("array element", e1.as_number() == 2.5);
+    e1.free();
+    JsValue e3 = arr.at(3);
+    check("nested array", e3.is_array() && e3.length() == 1);
+    e3.free();
+    JsValue past = arr.at(10);
+    check("past the end is undefined", past.is_undefined());
+    arr.free();
+    JsValue obj = ev(&ctx, "({b: 2, a: 'one', nested: {deep: true}})");
+    check("object kind", obj.kind() == JS_OBJECT);
+    check("get_num", obj.get_num("b") == 2.0);
+    let a_text: String;
+    String_init(&a_text, 8);
+    check("get_str", obj.get_str("a", &a_text) && a_text == "one");
+    check("get_str missing", !obj.get_str("zzz", &a_text));
+    a_text.free();
+    check("has", obj.has("nested") && !obj.has("missing") && obj.has("toString"));
+    let keys: List<String>;
+    List_init<String>(&keys, 4);
+    obj.keys(&keys);
+    check("keys in order", keys.size == 3 && keys.data[0] == "b" && keys.data[1] == "a" && keys.data[2] == "nested");
+    for (i in 0..keys.size) keys.data[i].free();
+    List_free<String>(&keys);
+    check("delete", obj.delete("b") && !obj.has("b"));
+    JsValue fnv = ev(&ctx, "(function f(x) { return x * 2; })");
+    check("function kind", fnv.is_function());
+    JsValue arg = ctx.num(21.0);
+    Result<JsValue, string> called = fnv.call(&arg, 1);
+    check("call", called.ok && called.value.as_number() == 42.0);
+    if (called.ok) called.value.free();
+    fnv.free();
+    JsValue err = ev(&ctx, "new TypeError('bad')");
+    check("error kind", err.kind() == JS_ERROR);
+    err.free();
+    obj.free();
+
+    // Eskiu to JavaScript
+    JsValue o = ctx.object();
+    o.set_num("pi", 3.25);
+    o.set_str("name", "Pok\xc3\xa9mon");
+    o.set_bool("ok", true);
+    o.set("nothing", ctx.null());
+    o.set("missing", ctx.undefined());
+    o.set("count", ctx.int(-12));
+    double[3] xs = {1.5, -2.0, 1e21};
+    o.set("xs", ctx.num_array(&xs[0], 3));
+    let names: List<String>;
+    List_init<String>(&names, 2);
+    let s1: String;
+    s1.from("a\"b");
+    names.push(s1);
+    let s2: String;
+    s2.from("c\\d");
+    names.push(s2);
+    o.set("names", ctx.str_array(&names));
+    for (i in 0..names.size) names.data[i].free();
+    List_free<String>(&names);
+    JsValue list = ctx.array();
+    list.push(ctx.num(1.0));
+    list.push(ctx.str("two"));
+    list.set_at(3, ctx.boolean(false));
+    o.set("list", list);
+    check("objects to JSON", json_is(&o,
+        "{\"pi\":3.25,\"name\":\"Pok\xc3\xa9mon\",\"ok\":true,\"nothing\":null,\"count\":-12,"
+        "\"xs\":[1.5,-2,1e+21],\"names\":[\"a\\\"b\",\"c\\\\d\"],\"list\":[1,\"two\",null,false]}"));
+    ctx.set_global("o", o);
+    JsValue seen = ev(&ctx, "o.missing === undefined && 'missing' in o && o.list.length === 4 && o.count === -12");
+    check("values seen by a script", seen.as_bool());
+    seen.free();
+
+    // a string with an embedded NUL, both ways
+    string raw = "a\0b";
+    JsValue z = ctx.str_len((*char)raw, 3);
+    ctx.set_global("z", z);
+    JsValue zl = ev(&ctx, "z.length === 3 && z.charCodeAt(1) === 0 ? z : ''");
+    String zs = zl.to_string();
+    check("embedded NUL", zs.len == 3 && zs.data[1] == 0 && zs.data[2] == 'b');
+    zs.free();
+    zl.free();
+
+    // JSON
+    Result<JsValue, string> pj = ctx.parse_json("{\"a\": [1, {\"b\": null}], \"c\": \"\\u00e9\"}");
+    check("parse_json", pj.ok);
+    if (pj.ok) {
+        check("parse_json round trip", json_is(&pj.value, "{\"a\":[1,{\"b\":null}],\"c\":\"\xc3\xa9\"}"));
+        let pretty: String;
+        String_init(&pretty, 64);
+        check("indented json", pj.value.to_json(2, &pretty) && pretty.contains("\n  \"a\"") != 0);
+        pretty.free();
+        pj.value.free();
+    }
+    Result<JsValue, string> bad = ctx.parse_json("{nope}");
+    check("bad json is an error", !bad.ok && strstr(bad.error, "SyntaxError") != null);
+    JsValue undef = ctx.undefined();
+    let none: String;
+    String_init(&none, 4);
+    check("undefined has no json", !undef.to_json(0, &none));
+    none.free();
+
+    // typed arrays
+    float[4] f = {1.0, 0.5, -2.0, 8.0};
+    JsValue ta = ctx.typed_array(JS_F32, (*void)&f[0], 16);
+    ctx.set_global("ta", ta);
+    JsValue sum = ev(&ctx, "ta instanceof Float32Array && ta.length === 4 ? ta.reduce((a, b) => a + b) : -1");
+    check("typed array to script", sum.as_number() == 7.5);
+    sum.free();
+    JsValue made = ev(&ctx, "new Int16Array([1, -2, 300]).subarray(1)");
+    int64 nbytes = 0;
+    *uint8 p = made.bytes(&nbytes);
+    check("typed array bytes", p != null && nbytes == 4 && ((*int16)p)[0] == -2 && ((*int16)p)[1] == 300);
+    made.free();
+    JsValue ab = ev(&ctx, "new Uint8Array([9, 8, 7]).buffer");
+    p = ab.bytes(&nbytes);
+    check("array buffer bytes", p != null && nbytes == 3 && p[0] == 9);
+    ab.free();
+    JsValue plain = ev(&ctx, "({})");
+    check("bytes of a plain object", plain.bytes(&nbytes) == null && nbytes == 0);
+    plain.free();
+    uint8[3] raw8 = {1, 2, 255};
+    JsValue u8 = ctx.typed_array(JS_U8, (*void)&raw8[0], 3);
+    raw8[0] = 100;   // the array holds a copy
+    ctx.set_global("u8", u8);
+    JsValue u8s = ev(&ctx, "u8[0] + u8[2]");
+    check("typed array is a copy", u8s.as_number() == 256.0);
+    u8s.free();
+
+    // dup keeps a value alive past the original's free
+    JsValue d1 = ev(&ctx, "({k: 'kept'})");
+    JsValue d2 = d1.dup();
+    d1.free();
+    JsValue kept = d2.get("k");
+    check("dup", str_is(&kept, "kept"));
+    kept.free();
+    d2.free();
+
+    // conversions that throw give a default and leave no exception behind
+    JsValue thrower = ev(&ctx, "({ valueOf() { throw new Error('no'); }, toString() { throw new Error('no'); } })");
+    check("as_number of a throwing object is NaN", thrower.as_number() != thrower.as_number());
+    let sink: String;
+    String_init(&sink, 4);
+    check("as_string of a throwing object fails", !thrower.as_string(&sink));
+    sink.free();
+    thrower.free();
+    JsValue after = ev(&ctx, "'still fine'");
+    check("no pending exception afterwards", str_is(&after, "still fine"));
+    after.free();
+
+    JsMemory m = rt.memory();
+    check("memory figures", m.malloc_size > 0 && m.objects > 0 && m.malloc_count > 0);
+
+    ctx.release();
+    int64 leaked = rt.release();
+    check("no objects leaked", leaked == 0);
+    check("every block freed", js_live_blocks() == 0 && js_live_bytes() == 0);
+    if (fails == 0) printf("values: ok\n");
+    return fails == 0 ? 0 : 1;
+}

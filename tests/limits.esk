@@ -1,0 +1,123 @@
+// Memory, stack and time limits, the interrupt handler and the garbage collector:
+// each limit stops the script with an error and leaves the context usable.
+import <io>;
+import <mem>;
+import <string>;
+import <result>;
+import <quickjs>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool still_works(*JsContext ctx) {
+    Result<JsValue, string> r = ctx.eval("[1, 2, 3].map(x => x * 2).join()", "after.js");
+    bool ok = r.ok;
+    if (ok) {
+        String s = r.value.to_string();
+        ok = s == "2,4,6";
+        s.free();
+        r.value.free();
+    }
+    return ok;
+}
+
+int main() {
+    *JsRuntime rt = js_runtime().value;
+    JsContext ctx = rt.context().value;
+    Result<JsValue, string> lib = ctx.eval(
+        "function spin() { for (;;) {} }\n"
+        "function recurse(n) { return recurse(n + 1) + 1; }\n"
+        "function hog() { const a = []; for (;;) a.push(new Array(1000).fill(1.5)); }\n"
+        "function depth(n) { return n === 0 ? 0 : 1 + depth(n - 1); }\n", "lib.js");
+    check("library", lib.ok);
+    if (lib.ok) lib.value.free();
+
+    // the stack limit: an error, not a crash
+    Result<JsValue, string> deep = ctx.call_global("recurse", null, 0);
+    check("default stack limit", !deep.ok && strstr(deep.error, "InternalError: stack overflow") != null);
+    check("stack error names the file", strstr(js_last_error().file.cstr(), "lib.js") != null);
+    rt.set_max_stack_size(64 * 1024);
+    JsValue n = ctx.num(1000.0);
+    Result<JsValue, string> d1 = ctx.call_global("depth", &n, 1);
+    check("a 64 KiB stack is too small for depth 1000", !d1.ok);
+    rt.set_max_stack_size(4 * 1024 * 1024);
+    Result<JsValue, string> d2 = ctx.call_global("depth", &n, 1);
+    check("a 4 MiB stack is enough", d2.ok && d2.value.as_number() == 1000.0);
+    check("usable after stack overflow", still_works(&ctx));
+
+    // the time limit
+    rt.set_time_limit(100);
+    Result<JsValue, string> sp = ctx.call_global("spin", null, 0);
+    check("time limit interrupts", !sp.ok && strstr(sp.error, "interrupted") != null);
+    check("interrupted flag", js_last_error().interrupted);
+    rt.set_time_limit(0);
+    check("usable after interrupt", still_works(&ctx));
+    // try/catch cannot swallow an interrupt
+    rt.set_time_limit(50);
+    Result<JsValue, string> caught = ctx.eval("try { spin(); } catch (e) { 'caught' }", "catch.js");
+    check("interrupt is not catchable", !caught.ok);
+    rt.set_time_limit(0);
+
+    // the interrupt handler
+    int polls = 0;
+    *int pp = &polls;
+    rt.set_interrupt(bool() {
+        *pp = *pp + 1;
+        return *pp >= 5;
+    });
+    Result<JsValue, string> sp2 = ctx.call_global("spin", null, 0);
+    check("interrupt handler stops the script", !sp2.ok && polls == 5 && js_last_error().interrupted);
+    rt.clear_interrupt();
+    check("usable after interrupt handler", still_works(&ctx));
+    Result<JsValue, string> plain = ctx.eval("throw new Error('x')", "plain.js");
+    check("an ordinary error is not an interrupt", !plain.ok && !js_last_error().interrupted);
+
+    // the memory limit
+    rt.gc();
+    rt.set_memory_limit(16 * 1024 * 1024);
+    Result<JsValue, string> h = ctx.call_global("hog", null, 0);
+    check("memory limit", !h.ok && strstr(h.error, "out of memory") != null);
+    rt.gc();
+    rt.set_memory_limit(0);
+    check("usable after out of memory", still_works(&ctx));
+    JsMemory m = rt.memory();
+    check("heap shrinks back after gc", m.malloc_size < 8 * 1024 * 1024);
+
+    // cycles are collected
+    rt.set_gc_threshold(1024 * 1024);
+    Result<JsValue, string> cyc = ctx.eval("for (let i = 0; i < 20000; i++) { const a = {}; const b = {a}; a.b = b; } 1", "cycles.js");
+    check("cycles", cyc.ok);
+    if (cyc.ok) cyc.value.free();
+    rt.gc();
+    JsMemory after = rt.memory();
+    check("cycles collected", after.objects < m.objects + 1000);
+
+    // pending jobs
+    Result<JsValue, string> pr = ctx.eval("globalThis.got = 0; Promise.resolve(5).then(v => { got = v; }); got", "jobs.js");
+    check("before jobs", pr.ok && pr.value.as_number() == 0.0 && rt.jobs_pending());
+    Result<int, string> ran = ctx.run_jobs();
+    check("run_jobs", ran.ok && ran.value == 1 && !rt.jobs_pending());
+    JsValue got = ctx.get_global("got");
+    check("job ran", got.as_number() == 5.0);
+    Result<JsValue, string> rj = ctx.eval("Promise.resolve().then(() => { throw new TypeError('in a job'); }); 0", "job.js");
+    if (rj.ok) rj.value.free();
+    Result<int, string> ran2 = ctx.run_jobs();
+    check("a job that throws", ran2.ok);   // a rejected promise nobody awaits is not an error
+    Result<JsValue, string> aw = ctx.eval("Promise.reject(new Error('awaited'))", "aw.js");
+    if (aw.ok) {
+        Result<JsValue, string> res = ctx.await(aw.value);
+        check("await of a rejected promise", !res.ok && strstr(res.error, "awaited") != null);
+    }
+
+    ctx.release();
+    check("no objects leaked", rt.release() == 0);
+    check("every block freed", js_live_blocks() == 0);
+    if (fails == 0) printf("limits: ok\n");
+    return fails == 0 ? 0 : 1;
+}

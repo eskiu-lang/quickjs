@@ -1,0 +1,238 @@
+// Host functions defined from Eskiu: closures over state, every argument kind,
+// optional and rest arguments, objects and arrays returned, callbacks kept and called
+// later, errors thrown in both directions, and `this`.
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <quickjs>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+// Runs `src` and checks that it evaluates to true.
+void expect_true(*JsContext ctx, string src) {
+    Result<JsValue, string> r = ctx.eval(src, "host.js");
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", src, r.error);
+        fails++;
+        return;
+    }
+    if (!r.value.as_bool()) {
+        printf("FAIL %s is not true\n", src);
+        fails++;
+    }
+    r.value.free();
+}
+
+struct World {
+    int steps;
+    double x;
+    String log;
+    List<JsValue> listeners;
+}
+
+int main() {
+    Result<*JsRuntime, string> rr = js_runtime();
+    if (!rr.ok) { printf("FAIL runtime: %s\n", rr.error); return 1; }
+    *JsRuntime rt = rr.value;
+    Result<JsContext, string> cr = rt.context();
+    JsContext ctx = cr.value;
+
+    let world: World;
+    world.steps = 0;
+    world.x = 0.0;
+    String_init(&world.log, 64);
+    List_init<JsValue>(&world.listeners, 4);
+    *World w = &world;
+
+    JsValue engine = ctx.object();
+    // state through a captured pointer
+    engine.set_fn("step", 0, JsValue(*JsContext c, *JsArgs a) {
+        w.steps++;
+        return c.int((int64)w.steps);
+    });
+    // numbers, an optional number, a string and a boolean
+    engine.set_fn("move", 3, JsValue(*JsContext c, *JsArgs a) {
+        double scale = a.opt_num(1, 1.0);
+        w.x += a.num(0) * scale;
+        if (a.flag(3)) w.log.append(a.str(2));
+        return c.num(w.x);
+    });
+    // a nullable string result (Option<String> in rquickjs: undefined when None)
+    engine.set_fn("lookup", 1, JsValue(*JsContext c, *JsArgs a) {
+        if (strcmp(a.str(0), "known") == 0) return c.str("found");
+        return c.undefined();
+    });
+    // rest arguments and an array argument
+    engine.set_fn("sum", 0, JsValue(*JsContext c, *JsArgs a) {
+        let xs: List<double>;
+        List_init<double>(&xs, 8);
+        a.rest_nums(0, &xs);
+        double t = 0.0;
+        for (i in 0..xs.size) t += xs.data[i];
+        List_free<double>(&xs);
+        return c.num(t);
+    });
+    engine.set_fn("dot", 2, JsValue(*JsContext c, *JsArgs a) {
+        let p: List<double>;
+        List_init<double>(&p, 4);
+        let q: List<double>;
+        List_init<double>(&q, 4);
+        a.numbers(0, &p);
+        a.numbers(1, &q);
+        double t = 0.0;
+        for (i in 0..p.size) t += p.data[i] * (i < q.size ? q.data[i] : 0.0);
+        List_free<double>(&p);
+        List_free<double>(&q);
+        return c.num(t);
+    });
+    // objects and arrays returned
+    engine.set_fn("cell", 2, JsValue(*JsContext c, *JsArgs a) {
+        JsValue o = c.object();
+        o.set_num("x", (double)a.int(0));
+        o.set_num("z", (double)a.int(1));
+        double[2] h = {0.5, 1.0};
+        o.set("heights", c.num_array(&h[0], 2));
+        o.set_bool("walkable", true);
+        return o;
+    });
+    // callbacks: kept with dup, called later from Eskiu
+    engine.set_fn("on", 1, JsValue(*JsContext c, *JsArgs a) {
+        if (!a.at(0).is_function()) return c.throw_type_error("on: a function is needed");
+        w.listeners.push(a.dup(0));
+        return c.undefined();
+    });
+    // a callback called during the host function
+    engine.set_fn("each", 2, JsValue(*JsContext c, *JsArgs a) {
+        JsValue f = a.at(1);
+        int64 n = (int64)a.int(0);
+        for (i in 0..n) {
+            JsValue arg = c.int(i);
+            Result<JsValue, string> r = c.call(&f, null, &arg, 1);
+            if (!r.ok) return c.throw_error(r.error);
+            r.value.free();
+        }
+        return c.undefined();
+    });
+    // errors thrown from Eskiu
+    engine.set_fn("fail", 1, JsValue(*JsContext c, *JsArgs a) {
+        return c.throw_range_error(a.str(0));
+    });
+    // `this`
+    engine.set_fn("self", 0, JsValue(*JsContext c, *JsArgs a) {
+        return a.this().dup();
+    });
+    // a JavaScript exception passed through unchanged
+    engine.set_fn("getter", 1, JsValue(*JsContext c, *JsArgs a) {
+        JsValue o = a.at(0);
+        return o.get("boom");
+    });
+    engine.set_str("version", "1.0");
+    ctx.set_global("engine", engine);
+
+    expect_true(&ctx, "engine.step() === 1 && engine.step() === 2");
+    expect_true(&ctx, "engine.move(2) === 2 && engine.move(1, 3, 'moved', true) === 5");
+    check("closure state", w.steps == 2 && w.x == 5.0 && w.log == "moved");
+    expect_true(&ctx, "engine.move(1, undefined) === 6 && engine.move(1, null) === 7");
+    expect_true(&ctx, "engine.lookup('known') === 'found' && engine.lookup('other') === undefined");
+    expect_true(&ctx, "engine.sum() === 0 && engine.sum(1, 2, 3.5) === 6.5");
+    expect_true(&ctx, "engine.dot([1, 2, 3], [4, 5, 6]) === 32");
+    expect_true(&ctx, "JSON.stringify(engine.cell(3, -4)) === '{\"x\":3,\"z\":-4,\"heights\":[0.5,1],\"walkable\":true}'");
+    expect_true(&ctx, "engine.step.name === 'step' && engine.move.length === 3 && typeof engine.on === 'function'");
+    expect_true(&ctx, "engine.self() === engine");
+    expect_true(&ctx, "engine.version === '1.0'");
+    expect_true(&ctx, "{ let seen = []; engine.each(3, i => seen.push(i * 10)); seen.join() === '0,10,20' }");
+
+    // an error thrown by a host function is a normal JavaScript exception
+    expect_true(&ctx, "(() => { try { engine.fail('too far'); } catch (e) { return e instanceof RangeError && e.message === 'too far'; } })()");
+    expect_true(&ctx, "(() => { try { engine.on(5); } catch (e) { return e instanceof TypeError; } })()");
+    // and reaches Eskiu with the script's stack when nobody catches it
+    Result<JsValue, string> unc = ctx.eval("function outer() { engine.fail('deep'); }\nouter();", "caller.js");
+    check("uncaught host error", !unc.ok && strstr(unc.error, "RangeError: deep") != null);
+    check("stack names the caller", !unc.ok && strstr(unc.error, "at outer (caller.js:1") != null);
+    // a JavaScript exception inside a host function goes through unchanged
+    Result<JsValue, string> pass = ctx.eval("engine.getter({ get boom() { throw new SyntaxError('from getter'); } })", "get.js");
+    check("exception passed through", !pass.ok && strstr(pass.error, "SyntaxError: from getter") != null);
+    // an exception in a callback called by the host comes back as an Error
+    Result<JsValue, string> cb = ctx.eval("engine.each(2, i => { if (i === 1) throw new Error('in callback'); })", "cb.js");
+    check("callback error", !cb.ok && strstr(cb.error, "in callback") != null);
+
+    // listeners kept across calls, called later
+    expect_true(&ctx, "globalThis.total = 0; engine.on(n => { total += n; return total; }); engine.on(n => total * 2); true");
+    check("listeners kept", w.listeners.size == 2);
+    for (frame in 0..3) {
+        JsValue arg = ctx.num(10.0);
+        for (i in 0..w.listeners.size) {
+            Result<JsValue, string> r = ctx.call(&w.listeners.data[i], null, &arg, 1);
+            if (!r.ok) {
+                printf("FAIL listener: %s\n", r.error);
+                fails++;
+            } else {
+                r.value.free();
+            }
+        }
+    }
+    expect_true(&ctx, "total === 30");
+
+    // call_global and call_global_opt
+    expect_true(&ctx, "globalThis.onUpdate = dt => { globalThis.t = (globalThis.t || 0) + dt; return t; }; true");
+    JsValue dt = ctx.num(0.25);
+    for (i in 0..4) {
+        Result<JsValue, string> r = ctx.call_global("onUpdate", &dt, 1);
+        check("onUpdate", r.ok);
+        if (r.ok) r.value.free();
+    }
+    expect_true(&ctx, "t === 1");
+    Result<JsValue, string> missing = ctx.call_global("onNothing", null, 0);
+    check("missing global function is an error", !missing.ok && strstr(missing.error, "onNothing is not a function") != null);
+    Result<JsValue, string> opt = ctx.call_global_opt("onNothing", null, 0);
+    check("optional missing global is undefined", opt.ok && opt.value.is_undefined());
+
+    // methods and constructors
+    JsValue date_ctor = ctx.get_global("Array");
+    JsValue three = ctx.num(3.0);
+    Result<JsValue, string> made = ctx.construct(&date_ctor, &three, 1);
+    check("construct", made.ok && made.value.is_array() && made.value.length() == 3);
+    if (made.ok) {
+        JsValue sep = ctx.str("-");
+        Result<JsValue, string> joined = made.value.call_method("join", &sep, 1);
+        check("call_method", joined.ok && joined.value.length() == 2);
+        if (joined.ok) joined.value.free();
+        sep.free();
+        Result<JsValue, string> nomethod = made.value.call_method("nope", null, 0);
+        check("missing method", !nomethod.ok);
+        made.value.free();
+    }
+    date_ctor.free();
+
+    // a throwing value from Eskiu
+    JsValue thrown = ctx.object();
+    thrown.set_num("code", 7.0);
+    engine = ctx.get_global("engine");
+    engine.set_fn("throwObj", 0, JsValue(*JsContext c, *JsArgs a) {
+        JsValue v = c.object();
+        v.set_num("code", 7.0);
+        return c.throw_value(v);
+    });
+    engine.free();
+    thrown.free();
+    expect_true(&ctx, "(() => { try { engine.throwObj(); } catch (e) { return e.code === 7; } })()");
+
+    for (i in 0..w.listeners.size) w.listeners.data[i].free();
+    List_free<JsValue>(&w.listeners);
+    world.log.free();
+    ctx.release();
+    int64 leaked = rt.release();
+    check("no objects leaked", leaked == 0);
+    check("every block freed", js_live_blocks() == 0);
+    if (fails == 0) printf("host: ok\n");
+    return fails == 0 ? 0 : 1;
+}

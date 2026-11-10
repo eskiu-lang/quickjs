@@ -1,0 +1,315 @@
+// Integration: a module graph on disk (tests/data/game) with relative imports, a bare
+// import from the root, an import without extension, a cycle, top-level await and a
+// dynamic import(), driven like a game: host functions on `engine`, onBoot once and
+// onUpdate every frame. Then module errors with their file and line, a loader of
+// in-memory modules, and a reload that rebuilds the runtime from changed files.
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <fs>;
+import <quickjs>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+struct Game {
+    double x;
+    int frames;
+    String log;
+}
+
+// The script names `file` ends with `suffix`.
+bool ends(string file, string suffix) {
+    int64 a = strlen(file);
+    int64 b = strlen(suffix);
+    return a >= b && strcmp(&file[a - b], suffix) == 0;
+}
+
+void game_graph() {
+    *JsRuntime rt = js_runtime().value;
+    rt.set_fs_loader("tests/data/game");
+    JsContext ctx = rt.context().value;
+    let game: Game;
+    String_init(&game.log, 32);
+    *Game g = &game;
+    JsValue engine = ctx.object();
+    engine.set_fn("startX", 0, JsValue(*JsContext c, *JsArgs a) { return c.num(10.0); });
+    engine.set_fn("log", 1, JsValue(*JsContext c, *JsArgs a) {
+        g.log.append(a.str(0));
+        return c.undefined();
+    });
+    engine.set_fn("setPos", 2, JsValue(*JsContext c, *JsArgs a) {
+        g.x = a.num(0);
+        g.frames = a.int(1);
+        return c.undefined();
+    });
+    ctx.set_global("engine", engine);
+
+    Result<JsValue, string> m = ctx.eval_file("tests/data/game/main.js");
+    check("main.js evaluates", m.ok);
+    if (!m.ok) {
+        printf("  %s\n", m.error);
+    } else {
+        JsValue ns = m.value;
+        Result<JsValue, string> boot = ctx.call_global_opt("onBoot", null, 0);
+        check("onBoot", boot.ok);
+        if (boot.ok) boot.value.free();
+        check("boot log (top-level await settled)", game.log == "boot route1 ready=yes");
+        JsValue dt = ctx.num(1.0 / 60.0);
+        for (frame in 0..60) {
+            Result<JsValue, string> r = ctx.call_global("onUpdate", &dt, 1);
+            if (!r.ok) {
+                printf("FAIL frame %d: %s\n", frame, r.error);
+                fails++;
+                break;
+            }
+            r.value.free();
+        }
+        check("frames ran", game.frames == 60);
+        check("player moved", game.x > 39.999 && game.x < 40.001);
+        Result<JsValue, string> warp = ctx.call_global_opt("onWarp", null, 0);
+        check("missing onWarp is skipped", warp.ok && warp.value.is_undefined());
+
+        // an exported function, called through the namespace
+        Result<JsValue, string> d = ns.call_method("describe", null, 0);
+        check("exported function", d.ok);
+        if (d.ok) {
+            String s = d.value.to_string();
+            // math.js is one instance for "util/math.js" and "../util/math.js"
+            check("module state is shared", s == "route1 40 60 121 pong");
+            if (!(s == "route1 40 60 121 pong")) printf("  describe() = %s\n", s.cstr());
+            s.free();
+            d.value.free();
+        }
+        JsValue def = ns.get("default");
+        check("default export", def.get_num("x") == 40.0);
+        def.free();
+        // a dynamic import() settles through the job queue
+        JsValue later = ns.get("later");
+        Result<JsValue, string> lv = ctx.await(later);
+        check("dynamic import", lv.ok && lv.value.as_number() == 42.0);
+        // import from Eskiu: the same instance as the graph's
+        Result<JsValue, string> math = ctx.import("util/math.js");
+        check("import", math.ok);
+        if (math.ok) {
+            Result<JsValue, string> n = math.value.call_method("calls", null, 0);
+            check("import gives the loaded instance", n.ok && n.value.as_number() == 121.0);
+            math.value.free();
+        }
+        Result<JsValue, string> nope = ctx.import("util/none.js");
+        check("import of a missing module", !nope.ok && strstr(nope.error, "could not resolve module 'util/none.js'") != null);
+        ns.free();
+    }
+    game.log.free();
+    ctx.release();
+    check("graph: no leaks", rt.release() == 0 && js_live_blocks() == 0);
+}
+
+void module_errors() {
+    *JsRuntime rt = js_runtime().value;
+    rt.set_fs_loader("tests/data/game");
+    JsContext ctx = rt.context().value;
+
+    Result<JsValue, string> syn = ctx.eval_file("tests/data/game/broken/syntax.js");
+    *JsError e = js_last_error();
+    check("syntax error", !syn.ok && e.name == "SyntaxError");
+    check("syntax error file and line", ends(e.file.cstr(), "tests/data/game/broken/syntax.js") && e.line == 3);
+    if (e.line != 3) printf("  %s\n", syn.error);
+
+    Result<JsValue, string> thr = ctx.eval_file("tests/data/game/broken/throws.js");
+    check("runtime error in an imported module", !thr.ok && e.name == "TypeError");
+    check("its file and line", ends(e.file.cstr(), "broken/deep.js") && e.line == 3 && e.column > 0);
+    check("the stack goes through the importer", !thr.ok && strstr(thr.error, "broken/throws.js:2") != null);
+    if (!thr.ok && strstr(thr.error, "broken/throws.js:2") == null) printf("  %s\n", thr.error);
+
+    Result<JsValue, string> mis = ctx.eval_file("tests/data/game/broken/missing.js");
+    check("missing import", !mis.ok && strstr(mis.error, "could not resolve module './not_here.js'") != null);
+
+    Result<JsValue, string> rej = ctx.eval_file("tests/data/game/broken/rejects.js");
+    check("top-level await rejection", !rej.ok && strstr(rej.error, "RangeError: rejected at top level") != null);
+
+    Result<JsValue, string> nofile = ctx.eval_file("tests/data/game/none.js");
+    check("missing entry file", !nofile.ok && strstr(nofile.error, "could not read") != null);
+
+    // a thrown non-Error value
+    Result<JsValue, string> str = ctx.eval("throw 'plain text'", "plain.js");
+    check("thrown string", !str.ok && strcmp(str.error, "plain text") == 0 && e.name.len == 0);
+    Result<JsValue, string> obj = ctx.eval("throw {code: 3}", "obj.js");
+    check("thrown object", !obj.ok && strstr(obj.error, "[object Object]") != null);
+    // after errors the context still works
+    Result<JsValue, string> fine = ctx.eval("1 + 1", "fine.js");
+    check("context usable after errors", fine.ok && fine.value.as_number() == 2.0);
+
+    ctx.release();
+    check("errors: no leaks", rt.release() == 0 && js_live_blocks() == 0);
+}
+
+struct MemModules {
+    List<String> names;
+    List<String> sources;
+}
+
+void memory_loader() {
+    let mods: MemModules;
+    List_init<String>(&mods.names, 4);
+    List_init<String>(&mods.sources, 4);
+    string[3] names = {"/v/main.js", "/v/lib/a.js", "/v/lib/b.js"};
+    string[3] srcs = {
+        "import { a } from './lib/a.js'; export const out = a() + 1;",
+        "import { b } from './b.js'; export const a = () => b * 2;",
+        "export const b = 20;"
+    };
+    for (i in 0..3) {
+        let n: String;
+        n.from(names[i]);
+        mods.names.push(n);
+        let s: String;
+        s.from(srcs[i]);
+        mods.sources.push(s);
+    }
+    *MemModules mm = &mods;
+    int resolved = 0;
+    *int rc = &resolved;
+    *JsRuntime rt = js_runtime().value;
+    rt.set_loader(bool(string base, string name, *String out) {
+        let joined: String;
+        String_init(&joined, 64);
+        int64 cut = -1;
+        for (i in 0..strlen(base)) {
+            if (base[i] == '/') cut = i;
+        }
+        if (cut >= 0) joined.append_bytes(base, cut + 1);
+        joined.append(name);
+        js_path_normalize(joined.cstr(), out);
+        joined.free();
+        *rc = *rc + 1;
+        return true;
+    }, bool(string path, *String out) {
+        for (i in 0..mm.names.size) {
+            if (mm.names.data[i] == path) {
+                out.append(mm.sources.data[i].cstr());
+                return true;
+            }
+        }
+        return false;
+    });
+    JsContext ctx = rt.context().value;
+    Result<JsValue, string> m = ctx.eval_module("/v/main.js", mods.sources.data[0].cstr());
+    check("in-memory modules", m.ok);
+    if (m.ok) {
+        check("in-memory result", m.value.get_num("out") == 41.0);
+        m.value.free();
+    } else {
+        printf("  %s\n", m.error);
+    }
+    check("resolver called per import", resolved == 2);
+    Result<JsValue, string> bad = ctx.eval_module("/v/x.js", "import './nowhere.js';");
+    check("loader refusal", !bad.ok && strstr(bad.error, "could not load module '/v/nowhere.js'") != null);
+    ctx.release();
+    check("memory loader: no leaks", rt.release() == 0 && js_live_blocks() == 0);
+    for (i in 0..3) {
+        mods.names.data[i].free();
+        mods.sources.data[i].free();
+    }
+    List_free<String>(&mods.names);
+    List_free<String>(&mods.sources);
+}
+
+// One boot of the scripts in `dir`: returns what main.js's value() gives.
+double boot_value(string dir) {
+    *JsRuntime rt = js_runtime().value;
+    rt.set_fs_loader(dir);
+    JsContext ctx = rt.context().value;
+    let path: String;
+    String_init(&path, 64);
+    String_appendf(&path, "%s/main.js", dir);
+    double v = -1.0;
+    Result<JsValue, string> m = ctx.eval_file(path.cstr());
+    if (m.ok) {
+        Result<JsValue, string> r = m.value.call_method("value", null, 0);
+        if (r.ok) v = r.value.as_number();
+        m.value.free();
+    } else {
+        printf("  %s\n", m.error);
+    }
+    path.free();
+    ctx.release();
+    if (rt.release() != 0) v = -2.0;
+    return v;
+}
+
+// Hot reload as the editor's playtest does it: drop the runtime, build a new one from
+// the changed files.
+void reload() {
+    let dir: String;
+    String_init(&dir, 64);
+    if (fs_temp_dir("eskiu-quickjs-", &dir) != 0) {
+        check("temp dir", false);
+        return;
+    }
+    let lib: String;
+    String_init(&lib, 64);
+    String_appendf(&lib, "%s/lib", dir.cstr());
+    fs_mkdir_p(lib.cstr());
+    let main_js: String;
+    String_init(&main_js, 64);
+    String_appendf(&main_js, "%s/main.js", dir.cstr());
+    let k_js: String;
+    String_init(&k_js, 64);
+    String_appendf(&k_js, "%s/lib/k.js", dir.cstr());
+    fs_write_text(main_js.cstr(), "import { k } from './lib/k.js'; export function value() { return k; }");
+    fs_write_text(k_js.cstr(), "export const k = 1;");
+    check("first boot", boot_value(dir.cstr()) == 1.0);
+    fs_write_text(k_js.cstr(), "export const k = 2;");
+    check("reloaded boot sees the change", boot_value(dir.cstr()) == 2.0);
+    for (i in 0..20) boot_value(dir.cstr());
+    check("reloads leave nothing behind", js_live_blocks() == 0);
+    fs_remove_all(dir.cstr());
+    dir.free();
+    lib.free();
+    main_js.free();
+    k_js.free();
+}
+
+void fs_resolve_rules() {
+    let out: String;
+    String_init(&out, 64);
+    check("relative", js_fs_resolve("tests/data/game", "tests/data/game/world/player.js", "../util/math.js", &out)
+        && out == "tests/data/game/util/math.js");
+    String_clear(&out);
+    check("bare from root", js_fs_resolve("tests/data/game", "x", "world/tiles", &out) && out == "tests/data/game/world/tiles.js");
+    String_clear(&out);
+    check("missing file", !js_fs_resolve("tests/data/game", "x", "world/none.js", &out) && out.len == 0);
+    String_clear(&out);
+    js_path_normalize("a/./b/../c//d/", &out);
+    check("normalize", out == "a/c/d");
+    String_clear(&out);
+    js_path_normalize("/a/../../b", &out);
+    check("normalize absolute", out == "/b");
+    String_clear(&out);
+    js_path_normalize("C:\\game\\scripts\\..\\data", &out);
+    check("normalize windows", out == "C:/game/data");
+    String_clear(&out);
+    js_path_normalize("../x/../../y", &out);
+    check("normalize leading ..", out == "../../y");
+    out.free();
+}
+
+int main() {
+    fs_resolve_rules();
+    game_graph();
+    module_errors();
+    memory_loader();
+    reload();
+    check("process: every block freed", js_live_blocks() == 0 && js_live_bytes() == 0);
+    if (fails == 0) printf("modules: ok\n");
+    return fails == 0 ? 0 : 1;
+}
