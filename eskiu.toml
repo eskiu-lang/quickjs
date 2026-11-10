@@ -1,0 +1,22 @@
+[package]
+name = "quickjs"
+version = "0.1.0"
+main = "examples/run.esk"
+
+[deps]
+
+# QuickJS (the release rquickjs 0.6.2 bundles, with its patches) and native/eskqjs.c, built
+# into one static library per platform by tools/build_native.sh and published as release
+# assets of this repository. eskiuc fetches the archive of the platform it builds for.
+[native.eskqjs]
+macos-arm64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-macos-arm64.tar.gz", sha256 = "d6d60bd22b2dc7b55026cc3e9d715236441f612b900845d2b138fe856a5467fb" }
+macos-x86_64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-macos-x86_64.tar.gz", sha256 = "6c368f392558e49cefd1c6609c5128fd09c289defefec6ce803aa45c91520cd9" }
+linux-x86_64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-linux-x86_64.tar.gz", sha256 = "133cf0059ed836314d3c8aad2502490f443a903e63720eeba5335b3d533a8de2" }
+linux-arm64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-linux-arm64.tar.gz", sha256 = "13d12026ba1c6104d4b61873c07b1bad61a25af2e71a94b180b0a70616de8200" }
+windows-x86_64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-windows-x86_64.tar.gz", sha256 = "a487a03d77a390ec3918c58806c62e131df8a0e4f89bc841bd17712c0e175c3f" }
+windows-arm64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-windows-arm64.tar.gz", sha256 = "fffc64825369e8c86d1e856f4b8f757357eb327f2779e62247d88a15aa14c69c" }
+ios-arm64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-ios-arm64.tar.gz", sha256 = "631be05218de0ddcebaae79d34f228f24f11ce558e17fa43f901479841be3d04" }
+ios-arm64-simulator = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-ios-arm64-simulator.tar.gz", sha256 = "53cc83ee3ddb658d9c80537348564c37d610a5217d972522f2bb8fb091a4c30e" }
+ios-x86_64-simulator = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-ios-x86_64-simulator.tar.gz", sha256 = "1e83ceebb77a54b0179fe02a25c9ac24efdf04742ffd60e9f8cdc2c328a08077" }
+android-arm64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-android-arm64.tar.gz", sha256 = "e50a771d120d246720269967b9b25537911cf234371d0d99dda41354cc3d5ed9" }
+android-x86_64 = { url = "https://github.com/eskiu-lang/quickjs/releases/download/v0.1.0/eskqjs-0.1.0-android-x86_64.tar.gz", sha256 = "48d0625516608f5b9e24f257e1487f84f993578cc7d1fe9efd78f5dac5ff2953" }
