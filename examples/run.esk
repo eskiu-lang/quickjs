@@ -1,0 +1,100 @@
+// Runs a JavaScript game script headless: loads an ES module with its imports from
+// the module's folder, gives it an `engine` object with log() and now(), calls
+// onBoot() once and onUpdate(dt) for a number of frames, and prints any error with
+// its file and line.
+//
+//     eskiuc examples/run.esk -o build/run
+//     build/run tests/data/game/main.js 60
+//
+// The module's folder is the root for bare imports ("util/math.js").
+
+import <io>;
+import <mem>;
+import <string>;
+import <result>;
+import <time>;
+import <quickjs>;
+
+Result<int, string> run(string path, int frames) {
+    *JsRuntime rt = js_runtime()?;
+    defer rt.release();
+    let root: String;
+    String_init(&root, 64);
+    defer root.free();
+    let norm: String;
+    String_init(&norm, 64);
+    defer norm.free();
+    js_path_normalize(path, &norm);
+    int64 cut = -1;
+    for (i in 0..norm.len) {
+        if (norm.data[i] == '/') cut = i;
+    }
+    if (cut > 0) root.append_bytes(norm.data, cut);
+    else root.append(".");
+    rt.set_fs_loader(root.cstr());
+    rt.set_max_stack_size(1024 * 1024);
+    JsContext ctx = rt.context()?;
+    defer ctx.release();
+
+    int64 t0 = time_monotonic_ms();
+    *int64 start = &t0;
+    JsValue engine = ctx.object();
+    engine.set_fn("log", 1, JsValue(*JsContext c, *JsArgs a) {
+        for (i in 0..a.len()) {
+            if (i > 0) printf(" ");
+            printf("%s", a.str(i));
+        }
+        printf("\n");
+        return c.undefined();
+    });
+    engine.set_fn("now", 0, JsValue(*JsContext c, *JsArgs a) {
+        return c.num((double)(time_monotonic_ms() - *start) / 1000.0);
+    });
+    engine.set_fn("startX", 0, JsValue(*JsContext c, *JsArgs a) { return c.num(0.0); });
+    engine.set_fn("setPos", 2, JsValue(*JsContext c, *JsArgs a) { return c.undefined(); });
+    ctx.set_global("engine", engine);
+
+    // a runaway boot stops after 10 s instead of hanging
+    rt.set_time_limit(10000);
+    JsValue ns = ctx.eval_file(norm.cstr())?;
+    defer ns.free();
+    JsValue booted = ctx.call_global_opt("onBoot", null, 0)?;
+    booted.free();
+    rt.set_time_limit(0);
+
+    JsValue dt = ctx.num(1.0 / 60.0);
+    JsValue update = ctx.get_global("onUpdate");
+    defer update.free();
+    if (update.is_function()) {
+        for (f in 0..frames) {
+            JsValue r = ctx.call(&update, null, &dt, 1)?;
+            r.free();
+        }
+    }
+    JsMemory m = rt.memory();
+    printf("ran %d frames; heap %lld KiB, %lld objects\n", update.is_function() ? frames : 0,
+        m.malloc_size / 1024, m.objects);
+    return Ok<int, string>(0);
+}
+
+int main(int argc, string* argv) {
+    if (argc < 2) {
+        printf("usage: run SCRIPT.js [FRAMES]\n");
+        return 2;
+    }
+    int frames = 60;
+    if (argc > 2) {
+        let s: String;
+        s.from(argv[2]);
+        frames = s.to_int();
+        s.free();
+    }
+    Result<int, string> r = run(argv[1], frames);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        *JsError e = js_last_error();
+        if (e.line > 0) printf("at %s line %d\n", e.file.cstr(), e.line);
+        return 1;
+    }
+    return 0;
+}
