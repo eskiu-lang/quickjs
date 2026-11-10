@@ -1,0 +1,185 @@
+// Runs Tallgrass's graphics-free battle rule scenarios through <quickjs>, the way its
+// tools/qa-rules runner does through rquickjs: the same 8 MiB JavaScript stack, module
+// resolution relative to the importer, the `engine` stub, `qa` and `print`.
+//
+//     eskiuc tools/battle_rules.esk -o build/battle_rules
+//     TALLGRASS_DIR=/path/to/tallgrass build/battle_rules [scenario ...]
+//
+// An optional local check, not part of `eskiuc test` or CI: it needs a Tallgrass checkout.
+// TALLGRASS_QA_PROJECT picks another project than $TALLGRASS_DIR/editor/src-tauri/templates.
+// Prints one line per scenario and exits 1 when any fails.
+
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <fs>;
+import <env>;
+import <time>;
+import <quickjs>;
+
+String g_data;   // the project's data directory
+
+// Resolution as in qa-rules: relative to the importing module's directory, the file
+// must exist; the name is the normalized path.
+bool qa_resolve(string base, string name, *String out) {
+    let joined: String;
+    String_init(&joined, 128);
+    defer joined.free();
+    int64 cut = -1;
+    int64 n = strlen(base);
+    for (i in 0..n) {
+        if (base[i] == '/') cut = i;
+    }
+    if (cut >= 0) joined.append_bytes(base, cut);
+    joined.append("/");
+    joined.append(name);
+    int64 mark = out.len;
+    js_path_normalize(joined.cstr(), out);
+    if (fs_is_file(out.cstr()) != 1) {
+        out.data[mark] = 0;
+        out.len = mark;
+        return false;
+    }
+    return true;
+}
+
+bool qa_load(string path, *String out) {
+    return fs_read_text(path, out) == 0;
+}
+
+JsValue qa_data_json(*JsContext c, *JsArgs a) {
+    let path: String;
+    String_init(&path, 128);
+    defer path.free();
+    path.append(g_data.cstr());
+    path.append("/");
+    path.append(a.str(0));
+    path.append(".json");
+    let text: String;
+    String_init(&text, 4096);
+    defer text.free();
+    if (fs_read_text(path.cstr(), &text) != 0) return c.undefined();
+    return c.str_len(text.data, text.len);
+}
+
+JsValue qa_print(*JsContext c, *JsArgs a) {
+    printf("%s\n", a.str(0));
+    return c.undefined();
+}
+
+const string PRELUDE = "Object.assign(engine,{rtpDir:'',projectDir:'',mapId:'qa',imageSize:()=>[96,96]});\n"
+    "globalThis.engine=new Proxy(engine,{get(target,key){return target[key]??(()=>null);}});\n"
+    "globalThis.console={log(){},warn(){},error(){}};\n"
+    "globalThis.qa={failures:0,passed:0,finished:false,assert(ok,message){if(ok)this.passed++;else{this.failures++;print('FAIL '+message);}},done(){this.finished=true;}};\n";
+
+// Runs one scenario; returns true when it passed. *passed gets its assertion count.
+bool run(string root, string project, string name, *int64 passed) {
+    *passed = 0;
+    Result<*JsRuntime, string> rr = js_runtime();
+    if (!rr.ok) { printf("%s\n", rr.error); return false; }
+    *JsRuntime rt = rr.value;
+    rt.set_max_stack_size(8 * 1024 * 1024);
+    rt.set_loader(qa_resolve, qa_load);
+    Result<JsContext, string> cr = rt.context();
+    if (!cr.ok) { printf("%s\n", cr.error); rt.release(); return false; }
+    JsContext ctx = cr.value;
+    bool ok = false;
+
+    JsValue engine = ctx.object();
+    engine.set_fn("dataJson", 1, qa_data_json);
+    ctx.set_global("engine", engine);
+    ctx.set_global("print", ctx.function("print", 1, qa_print));
+    Result<JsValue, string> pre = ctx.eval(PRELUDE, "<prelude>");
+    if (!pre.ok) {
+        printf("%s: prelude: %s\n", name, pre.error);
+    } else {
+        pre.value.free();
+        let boot: String;
+        String_init(&boot, 256);
+        String_appendf(&boot, "%s/qa/%s/boot.js", root, name);
+        let src: String;
+        String_init(&src, 65536);
+        let entry: String;
+        String_init(&entry, 256);
+        String_appendf(&entry, "%s/scripts/__qa__.js", project);
+        let entry_name: String;
+        String_init(&entry_name, 256);
+        js_path_normalize(entry.cstr(), &entry_name);
+        if (fs_read_text(boot.cstr(), &src) != 0) {
+            printf("%s: cannot read %s\n", name, boot.cstr());
+        } else {
+            Result<JsValue, string> m = ctx.eval_module(entry_name.cstr(), src.cstr());
+            if (!m.ok) {
+                printf("%s: %s\n", name, m.error);
+            } else {
+                m.value.free();
+                Result<JsValue, string> fin = ctx.eval("qa.finished&&qa.failures===0", "<qa>");
+                Result<JsValue, string> cnt = ctx.eval("qa.passed", "<qa>");
+                if (fin.ok && cnt.ok) {
+                    ok = fin.value.as_bool();
+                    *passed = cnt.value.as_int64();
+                }
+                if (fin.ok) fin.value.free();
+                if (cnt.ok) cnt.value.free();
+            }
+        }
+        boot.free();
+        src.free();
+        entry.free();
+        entry_name.free();
+    }
+    ctx.release();
+    int64 leaked = rt.release();
+    if (leaked != 0) {
+        printf("%s: %lld JavaScript objects leaked\n", name, leaked);
+        ok = false;
+    }
+    return ok;
+}
+
+int main(int argc, string* argv) {
+    string root = env_get("TALLGRASS_DIR");
+    if (root == null) {
+        printf("usage: TALLGRASS_DIR=/path/to/tallgrass battle_rules [scenario ...]\n");
+        return 2;
+    }
+    let project: String;
+    String_init(&project, 256);
+    string env_project = env_get("TALLGRASS_QA_PROJECT");
+    if (env_project != null) project.append(env_project);
+    else String_appendf(&project, "%s/editor/src-tauri/templates", root);
+    String_init(&g_data, 256);
+    String_appendf(&g_data, "%s/data", project.cstr());
+
+    let names: List<string>;
+    List_init<string>(&names, 16);
+    if (argc > 1) {
+        for (i in 1..argc) names.push(argv[i]);
+    } else {
+        names.push("battle_rules_core");
+        names.push("battle_doubles_moves");
+        names.push("battle_ai_items");
+        names.push("battle_clauses");
+        names.push("battle_primal_gems");
+        names.push("form_data");
+        names.push("battle_gen9");
+        names.push("battle_illusion");
+    }
+    int failed = 0;
+    int64 total = 0;
+    int64 t0 = time_monotonic_ms();
+    for (i in 0..names.size) {
+        int64 passed = 0;
+        int64 s0 = time_monotonic_ms();
+        bool ok = run(root, project.cstr(), names.data[i], &passed);
+        total += passed;
+        printf("%s QuickJS %s: %lld passed (%lld ms)\n", ok ? "ok" : "FAIL", names.data[i], passed,
+            time_monotonic_ms() - s0);
+        if (!ok) failed++;
+    }
+    printf("%d of %d scenarios passed, %lld assertions, %lld ms; live blocks after release: %lld\n",
+        names.size - failed, names.size, total, time_monotonic_ms() - t0, js_live_blocks());
+    return failed > 0 ? 1 : 0;
+}
