@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Each job builds libeskqjs from native/ for its own platform and seeds it under the
+# SHA-256 eskiu.toml names (tools/build_native.sh --seed), so the tests run against
+# this checkout's C code, not the published archives.
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: |
+          curl -fsSL https://eskiu-lang.org/install.sh | ESKIU_PREFIX=$HOME/.eskiu sh
+          echo "$HOME/.eskiu/bin" >> $GITHUB_PATH
+      - name: Build QuickJS
+        run: LINUX_CC=cc tools/build_native.sh --seed ${{ matrix.platform }}
+      - name: Tests
+        run: eskiuc test
+      - name: Tests (-O2)
+        run: eskiuc test -O2
+      - name: API reference is current
+        run: python3 -I tools/gen_api.py --check
+      - name: Example
+        run: |
+          mkdir -p build
+          eskiuc examples/run.esk -o build/run
+          build/run tests/data/game/main.js 60 | tee build/run.txt
+          grep -q "ran 60 frames" build/run.txt
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: brew install eskiu-lang/eskiu/eskiu
+      - name: Build QuickJS
+        run: tools/build_native.sh --seed macos-arm64
+      - name: Tests
+        run: eskiuc test
+      - name: Tests (-O2)
+        run: eskiuc test -O2
+      - name: Example
+        run: |
+          mkdir -p build
+          eskiuc examples/run.esk -o build/run
+          build/run tests/data/game/main.js 60 | tee build/run.txt
+          grep -q "ran 60 frames" build/run.txt
+      - name: Apple and Android libraries build and link
+        run: |
+          tools/build_native.sh --seed macos-x86_64 ios-arm64 ios-arm64-simulator ios-x86_64-simulator android-arm64 android-x86_64
+          mkdir -p build/xc
+          for t in arm64-apple-ios15.0 arm64-apple-ios15.0-simulator aarch64-linux-android24 x86_64-linux-android24; do
+            eskiuc tests/host.esk --target $t -o build/xc/host-$t
+          done
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc unzip diffutils
+      - name: Install Eskiu
+        run: |
+          curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
+          # The archive's paths use backslashes; unzip extracts it and exits with 1 (a warning).
+          unzip -q eskiu.zip -d $HOME/eskiu || [ $? -eq 1 ]
+          test -x $HOME/eskiu/bin/eskiuc.exe
+          # One package home for the MSYS2 shell and the native eskiuc.exe.
+          echo "ESKIU_HOME=$(cygpath -m "$HOME")/eskiu-home" >> $GITHUB_ENV
+      - name: Build QuickJS
+        run: tools/build_native.sh --seed windows-x86_64
+      - name: Tests
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          CC=gcc eskiuc test
+      - name: Example
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          mkdir -p build
+          CC=gcc eskiuc examples/run.esk -o build/run.exe
+          build/run.exe tests/data/game/main.js 60 | tee build/run.txt
+          grep -q "ran 60 frames" build/run.txt
