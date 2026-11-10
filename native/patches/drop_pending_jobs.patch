@@ -1,0 +1,39 @@
+--- a/quickjs.c	2026-11-10 15:03:43
++++ b/quickjs.c	2026-11-10 15:03:43
+@@ -1941,6 +1941,26 @@
+ {
+     if (rt)
+         rt->rt_info = s;
++}
++
++/* Frees the pending exception and the pending jobs without running them, the
++   first steps of JS_FreeRuntime, so that an embedder can count the objects still
++   alive before freeing the runtime. */
++void JS_DropPendingJobs(JSRuntime *rt)
++{
++    struct list_head *el, *el1;
++    int i;
++
++    JS_FreeValueRT(rt, rt->current_exception);
++    rt->current_exception = JS_NULL;
++
++    list_for_each_safe(el, el1, &rt->job_list) {
++        JSJobEntry *e = list_entry(el, JSJobEntry, link);
++        for(i = 0; i < e->argc; i++)
++            JS_FreeValueRT(rt, e->argv[i]);
++        js_free_rt(rt, e);
++    }
++    init_list_head(&rt->job_list);
+ }
+ 
+ void JS_FreeRuntime(JSRuntime *rt)
+--- a/quickjs.h	2026-11-10 15:03:43
++++ b/quickjs.h	2026-11-10 15:03:43
+@@ -343,6 +343,7 @@
+ void JS_UpdateStackTop(JSRuntime *rt);
+ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
+ void JS_FreeRuntime(JSRuntime *rt);
++void JS_DropPendingJobs(JSRuntime *rt);
+ void *JS_GetRuntimeOpaque(JSRuntime *rt);
+ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
+ typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
