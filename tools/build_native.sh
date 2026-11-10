@@ -85,7 +85,8 @@ toolchain() {
             # no COFF time stamp, so the archive is the same on every build
             echo "$m/bin/$arch-w64-mingw32-clang gnu -mno-incremental-linker-compatible"
         elif command -v $arch-w64-mingw32-gcc >/dev/null 2>&1; then
-            echo "$arch-w64-mingw32-gcc gnu -Wa,--no-insert-timestamp"
+            # GNU as writes no COFF time stamp into objects
+            echo "$arch-w64-mingw32-gcc gnu"
         fi ;;
     linux-x86_64|linux-arm64)
         arch=x86_64; [ "$1" = linux-arm64 ] && arch=aarch64
